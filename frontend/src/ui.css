@@ -496,6 +496,8 @@ input[type='color'] {
 
 .data-list .eye:hover,
 .data-list .del:hover {
+  /* beat the global button:hover ink fill - these are bare glyphs */
+  background: transparent;
   color: var(--ink);
 }
 

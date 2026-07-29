@@ -466,6 +466,14 @@ export default function App() {
     )
   }
 
+  const setGroupWaypointsVisible = (source: string, visible: boolean) => {
+    setOverlays((prev) =>
+      prev.map((o) =>
+        o.source === source && o.kind !== 'track' ? { ...o, visible } : o,
+      ),
+    )
+  }
+
   const selected = overlays.find((o) => o.id === selectedId) ?? null
   const hf = viewerRef.current?.hf ?? null
   const elevOf = (lon: number | null, lat: number | null): number | null => {
@@ -748,20 +756,38 @@ export default function App() {
                   </li>
                 ))
                 if (g.source === null) return <Fragment key="ungrouped">{rows}</Fragment>
-                const firstPin = g.items.find(
-                  (o) => o.kind === 'note' || o.kind === 'photo',
-                ) as { scale?: number } | undefined
+                const waypoints = g.items.filter((o) => o.kind !== 'track') as (
+                  | NoteOverlay
+                  | PhotoOverlay
+                )[]
+                const allWptsVisible =
+                  waypoints.length > 0 && waypoints.every((o) => o.visible)
                 return (
                   <Fragment key={`g:${g.source}`}>
                     <li className="group-head">
+                      {waypoints.length > 0 && (
+                        <button
+                          className="eye"
+                          title={
+                            allWptsVisible
+                              ? 'Hide all waypoints from this file'
+                              : 'Show all waypoints from this file'
+                          }
+                          onClick={() =>
+                            setGroupWaypointsVisible(g.source!, !allWptsVisible)
+                          }
+                        >
+                          {allWptsVisible ? '●' : '○'}
+                        </button>
+                      )}
                       <span className="group-name">{g.source}</span>
-                      {firstPin && (
+                      {waypoints.length > 0 && (
                         <input
                           type="range"
                           min={0.3}
                           max={2}
                           step={0.1}
-                          value={firstPin.scale ?? 1}
+                          value={waypoints[0].scale ?? 1}
                           onChange={(e) =>
                             setGroupScale(g.source!, parseFloat(e.target.value))
                           }
