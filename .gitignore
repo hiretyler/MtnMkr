@@ -1,0 +1,20 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Backend data cache (fetched DEMs, textures, uploads)
+backend/cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Personal trip data - never commit tracks, photos, or project exports
+*.gpx
+*.kml
+*.kmz
+*.mtnmkr.json
+
+# OS / editor
+.DS_Store
