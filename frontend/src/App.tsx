@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api'
 import { formatDMS, trackLengthKm } from './geo'
 import { parseGpx, parseKml, parseKmz, photoFromFile } from './parsers'
+import { peaksOf, type PeakClass } from './peaks'
 import { elevDisplay, elevTickStep, fmtDistKm, fmtElev, fmtRes, type Units } from './units'
 import type {
   AreaMeta,
@@ -55,6 +56,7 @@ export default function App() {
   const [results, setResults] = useState<SearchResult[]>([])
   const [searching, setSearching] = useState(false)
   const [searched, setSearched] = useState(false)
+  const [peakIndex, setPeakIndex] = useState<PeakClass | null>(null)
   const [units, setUnits] = useState<Units>(() =>
     localStorage.getItem('mtnmkr-units') === 'imperial' ? 'imperial' : 'metric',
   )
@@ -158,6 +160,7 @@ export default function App() {
         setMode({ type: 'idle' })
         setResults([])
         setSearched(false)
+        setPeakIndex(null)
       }
     }
     window.addEventListener('keydown', onKey)
@@ -179,6 +182,7 @@ export default function App() {
       if (searchWrapRef.current && !searchWrapRef.current.contains(e.target as Node)) {
         setResults([])
         setSearched(false)
+        setPeakIndex(null)
       }
     }
     document.addEventListener('pointerdown', onDown)
@@ -239,6 +243,7 @@ export default function App() {
       void loadAreaAt(parseFloat(m[1]), parseFloat(m[2]), null)
       return
     }
+    setPeakIndex(null)
     setSearching(true)
     setResults([])
     setSearched(false)
@@ -391,6 +396,19 @@ export default function App() {
 
   // ---- derived ----------------------------------------------------------
 
+  const classPeaks = useMemo(() => (peakIndex ? peaksOf(peakIndex) : []), [peakIndex])
+  const shownPeaks = useMemo(() => {
+    const needle = q.trim().toLowerCase()
+    return needle ? classPeaks.filter((p) => p.n.toLowerCase().includes(needle)) : classPeaks
+  }, [classPeaks, q])
+
+  const toggleIndex = (cls: PeakClass) => {
+    setResults([])
+    setSearched(false)
+    setQ('')
+    setPeakIndex((prev) => (prev === cls ? null : cls))
+  }
+
   const selected = overlays.find((o) => o.id === selectedId) ?? null
   const hf = viewerRef.current?.hf ?? null
   const elevOf = (lon: number | null, lat: number | null): number | null => {
@@ -450,15 +468,57 @@ export default function App() {
                   setQ(e.target.value)
                   setSearched(false)
                 }}
-                placeholder='Peak name or "lat, lon"'
+                placeholder={peakIndex ? 'Filter the list' : 'Peak name or "lat, lon"'}
                 aria-label="Search for a peak"
               />
               <button type="submit" disabled={searching}>
                 {searching ? '...' : 'Find'}
               </button>
             </form>
-            {(results.length > 0 || (searched && results.length === 0)) && (
+            <div className="index-row">
+              <span className="index-label">Colorado index</span>
+              <button
+                className={peakIndex === '14' ? 'active' : ''}
+                onClick={() => toggleIndex('14')}
+              >
+                14ers
+              </button>
+              <button
+                className={peakIndex === '13' ? 'active' : ''}
+                onClick={() => toggleIndex('13')}
+              >
+                13ers
+              </button>
+            </div>
+            {(peakIndex !== null || results.length > 0 || (searched && results.length === 0)) && (
               <ul className="results">
+                {peakIndex !== null && (
+                  <>
+                    <li className="list-head mono">
+                      {shownPeaks.length === classPeaks.length
+                        ? `${classPeaks.length} peaks`
+                        : `${shownPeaks.length} of ${classPeaks.length} peaks`}
+                      {peakIndex === '14' ? ' ≥ 14,000 ft' : ' 13,000-13,999 ft'} · 14ers.com
+                    </li>
+                    {shownPeaks.map((p) => (
+                      <li key={`${p.n}:${p.lat}`}>
+                        <button
+                          onClick={() => {
+                            setPeakIndex(null)
+                            setQ(p.n)
+                            void loadAreaAt(p.lat, p.lon, p.n)
+                          }}
+                        >
+                          <span className="result-name">{p.n}</span>
+                          <span className="result-detail">{fmtElev(p.e, units)}</span>
+                        </button>
+                      </li>
+                    ))}
+                    {shownPeaks.length === 0 && (
+                      <li className="no-hit">No peaks match that filter.</li>
+                    )}
+                  </>
+                )}
                 {results.map((r, i) => (
                   <li key={i}>
                     <button
@@ -644,7 +704,7 @@ export default function App() {
         </section>
 
         <footer className="credits mono">
-          Elevation USGS 3DEP · Topo and NAIP USGS · Search OSM Nominatim
+          Elevation USGS 3DEP · Topo and NAIP USGS · Search Photon/OSM · Peak index 14ers.com
         </footer>
       </aside>
 

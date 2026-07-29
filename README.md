@@ -15,6 +15,10 @@ GPS tracks, geotagged photos, and trip notes on top.
   grid detail, and get a mesh built from USGS 3DEP - down to ~1 m lidar where
   available. Outside 3DEP coverage it falls back to ~30 m global tiles
   (Terrarium), which matches Google Earth rather than beating it.
+- **Colorado index**: one-click, filterable lists of all Colorado 14ers and
+  13ers (14ers.com waypoint data, bundled as JSON - regenerate with
+  `backend/scripts/gpx_to_peaks_json.py`). Search still covers the rest of
+  the world.
 - **Draped layers**: shaded relief, USGS topo, NAIP satellite, or any GeoTIFF
   you upload (scanned quads, drone orthos) - warped onto the terrain
   server-side.
@@ -65,7 +69,7 @@ backend/   FastAPI
   dem.py            3DEP ImageServer export (primary), Terrarium tiles (fallback)
   imagery.py        USGS topo / NAIP basemap export for the same bbox
   custom_layers.py  user GeoTIFF -> warped PNG via rasterio
-  search.py         Nominatim geocoding proxy
+  search.py         Photon geocoding proxy (terrain features only)
 ```
 
 Everything is fetched in EPSG:3857 so DEM and textures align pixel-for-pixel;
@@ -99,4 +103,6 @@ another endpoint.
 - Fallback elevation: Terrarium tiles on AWS Open Data (Mapzen/Linux
   Foundation, various upstream licenses)
 - Topo and satellite: USGS National Map basemaps (public domain)
-- Geocoding: OpenStreetMap Nominatim (ODbL; light personal use)
+- Geocoding: Photon by komoot, OSM data (ODbL; light personal use)
+- Colorado peak index: 14ers.com waypoint export (use with caution, per
+  their disclaimer)
