@@ -26,6 +26,8 @@ export interface TrackOverlay {
   color: string
   visible: boolean
   segments: TrackPoint[][]
+  /** Importing file name; overlays sharing a source group together */
+  source?: string
 }
 
 export interface PhotoOverlay {
@@ -37,6 +39,9 @@ export interface PhotoOverlay {
   lon: number | null
   lat: number | null
   dataUrl: string
+  source?: string
+  /** Marker size multiplier (default 1) */
+  scale?: number
 }
 
 export interface NoteOverlay {
@@ -47,6 +52,9 @@ export interface NoteOverlay {
   lon: number
   lat: number
   body: string
+  source?: string
+  /** Marker size multiplier (default 1) */
+  scale?: number
 }
 
 export type Overlay = TrackOverlay | PhotoOverlay | NoteOverlay

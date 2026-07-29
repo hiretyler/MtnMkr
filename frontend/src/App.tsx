@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api'
 import { formatDMS, trackLengthKm } from './geo'
 import { parseGpx, parseKml, parseKmz, photoFromFile } from './parsers'
@@ -216,9 +216,11 @@ export default function App() {
         setMeta(m)
         setCustomLayers([])
         if (layer.startsWith('custom:')) setLayer('shaded')
-        location.hash = `lat=${lat.toFixed(5)}&lon=${lon.toFixed(5)}&r=${radius}&s=${px}${
+        const hash = `lat=${lat.toFixed(5)}&lon=${lon.toFixed(5)}&r=${radius}&s=${px}${
           name ? `&name=${encodeURIComponent(name)}` : ''
         }`
+        lastHashRef.current = hash
+        location.hash = hash
       } catch (e) {
         showError(e)
       } finally {
@@ -229,20 +231,35 @@ export default function App() {
   )
 
   const didInit = useRef(false)
-  useEffect(() => {
-    if (didInit.current) return
-    didInit.current = true
+  const lastHashRef = useRef('')
+  const loadFromHash = useCallback(() => {
     const p = new URLSearchParams(location.hash.slice(1))
     const lat = parseFloat(p.get('lat') ?? '')
     const lon = parseFloat(p.get('lon') ?? '')
-    if (isFinite(lat) && isFinite(lon)) {
-      const r = parseFloat(p.get('r') ?? '') || 4
-      const s = parseInt(p.get('s') ?? '') || 1024
-      setRadiusKm(r)
-      setSize(s)
-      void loadAreaAt(lat, lon, p.get('name'), r, s)
-    }
+    if (!isFinite(lat) || !isFinite(lon)) return
+    const r = parseFloat(p.get('r') ?? '') || 4
+    const s = parseInt(p.get('s') ?? '') || 1024
+    setRadiusKm(r)
+    setSize(s)
+    void loadAreaAt(lat, lon, p.get('name'), r, s)
   }, [loadAreaAt])
+
+  useEffect(() => {
+    if (didInit.current) return
+    didInit.current = true
+    loadFromHash()
+  }, [loadFromHash])
+
+  // Editing the hash by hand (or following an in-page link) rebuilds the
+  // terrain; our own hash writes in loadAreaAt are ignored via lastHashRef
+  useEffect(() => {
+    const onHash = () => {
+      if (location.hash.slice(1) === lastHashRef.current) return
+      loadFromHash()
+    }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [loadFromHash])
 
   const onSearch = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -288,6 +305,7 @@ export default function App() {
             color: TRACK_COLORS[trackCount.current++ % TRACK_COLORS.length],
             visible: true,
             segments: t.segments,
+            source: file.name,
           } satisfies TrackOverlay)
         }
         for (const pt of parsed.points) {
@@ -299,6 +317,7 @@ export default function App() {
             lon: pt.lon,
             lat: pt.lat,
             body: pt.body,
+            source: file.name,
           } satisfies NoteOverlay)
         }
         if (added.length === 0) {
@@ -418,6 +437,33 @@ export default function App() {
     setSearched(false)
     setQ('')
     setPeakIndex((prev) => (prev === cls ? null : cls))
+  }
+
+  /** Overlays grouped by importing file; hand-added items have no source. */
+  const grouped = useMemo(() => {
+    const order: { source: string | null; items: Overlay[] }[] = []
+    const index = new Map<string | null, { source: string | null; items: Overlay[] }>()
+    for (const o of overlays) {
+      const key = o.source ?? null
+      let g = index.get(key)
+      if (!g) {
+        g = { source: key, items: [] }
+        index.set(key, g)
+        order.push(g)
+      }
+      g.items.push(o)
+    }
+    return order
+  }, [overlays])
+
+  const setGroupScale = (source: string, v: number) => {
+    setOverlays((prev) =>
+      prev.map((o) =>
+        o.source === source && (o.kind === 'note' || o.kind === 'photo')
+          ? { ...o, scale: v }
+          : o,
+      ),
+    )
   }
 
   const selected = overlays.find((o) => o.id === selectedId) ?? null
@@ -668,38 +714,66 @@ export default function App() {
             </div>
           ) : (
             <ul className="data-list">
-              {overlays.map((o) => (
-                <li key={o.id} className={o.id === selectedId ? 'selected' : ''}>
-                  <button
-                    className="eye"
-                    title={o.visible ? 'Hide' : 'Show'}
-                    onClick={() => updateOverlay(o.id, { visible: !o.visible })}
-                  >
-                    {o.visible ? '●' : '○'}
-                  </button>
-                  <button className="data-name" onClick={() => setSelectedId(o.id)}>
-                    {o.kind === 'track' && (
-                      <span className="chip" style={{ background: o.color }} />
-                    )}
-                    {o.kind === 'photo' && <span className="glyph">▣</span>}
-                    {o.kind === 'note' && <span className="glyph">✚</span>}
-                    <span className="label">{o.name}</span>
-                    {o.kind === 'photo' && o.lon == null && (
-                      <span className="unplaced">unplaced</span>
-                    )}
-                  </button>
-                  <button
-                    className="del"
-                    title="Remove"
-                    onClick={() => {
-                      setOverlays((prev) => prev.filter((x) => x.id !== o.id))
-                      if (selectedId === o.id) setSelectedId(null)
-                    }}
-                  >
-                    ✕
-                  </button>
-                </li>
-              ))}
+              {grouped.map((g) => {
+                const rows = g.items.map((o) => (
+                  <li key={o.id} className={o.id === selectedId ? 'selected' : ''}>
+                    <button
+                      className="eye"
+                      title={o.visible ? 'Hide' : 'Show'}
+                      onClick={() => updateOverlay(o.id, { visible: !o.visible })}
+                    >
+                      {o.visible ? '●' : '○'}
+                    </button>
+                    <button className="data-name" onClick={() => setSelectedId(o.id)}>
+                      {o.kind === 'track' && (
+                        <span className="chip" style={{ background: o.color }} />
+                      )}
+                      {o.kind === 'photo' && <span className="glyph">▣</span>}
+                      {o.kind === 'note' && <span className="glyph">✚</span>}
+                      <span className="label">{o.name}</span>
+                      {o.kind === 'photo' && o.lon == null && (
+                        <span className="unplaced">unplaced</span>
+                      )}
+                    </button>
+                    <button
+                      className="del"
+                      title="Remove"
+                      onClick={() => {
+                        setOverlays((prev) => prev.filter((x) => x.id !== o.id))
+                        if (selectedId === o.id) setSelectedId(null)
+                      }}
+                    >
+                      ✕
+                    </button>
+                  </li>
+                ))
+                if (g.source === null) return <Fragment key="ungrouped">{rows}</Fragment>
+                const firstPin = g.items.find(
+                  (o) => o.kind === 'note' || o.kind === 'photo',
+                ) as { scale?: number } | undefined
+                return (
+                  <Fragment key={`g:${g.source}`}>
+                    <li className="group-head">
+                      <span className="group-name">{g.source}</span>
+                      {firstPin && (
+                        <input
+                          type="range"
+                          min={0.3}
+                          max={2}
+                          step={0.1}
+                          value={firstPin.scale ?? 1}
+                          onChange={(e) =>
+                            setGroupScale(g.source!, parseFloat(e.target.value))
+                          }
+                          title="Waypoint marker size"
+                          aria-label={`Waypoint marker size for ${g.source}`}
+                        />
+                      )}
+                    </li>
+                    {rows}
+                  </Fragment>
+                )
+              })}
             </ul>
           )}
         </section>

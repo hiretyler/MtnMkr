@@ -454,6 +454,32 @@ input[type='color'] {
   border-radius: 2px;
 }
 
+.data-list .group-head {
+  gap: 8px;
+  padding: 8px 2px 3px;
+  border-bottom: 1px solid var(--hairline);
+  margin-bottom: 2px;
+}
+
+.group-name {
+  flex: 1;
+  min-width: 0;
+  font-family: 'Barlow Semi Condensed', sans-serif;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.group-head input[type='range'] {
+  width: 86px;
+  flex: 0 0 auto;
+}
+
 .data-list li.selected {
   background: var(--paper-raised);
   box-shadow: inset 2px 0 0 var(--contour);

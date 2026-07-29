@@ -306,8 +306,12 @@ export class Viewer {
     if (!hf) return
 
     const size = hf.meta.ground_size_m
-    const lift = THREE.MathUtils.clamp(size / 400, 2, 25)
-    const maxSeg = size / 250
+    // Clearance scales with DEM resolution, not area size: just enough to
+    // clear bilinear-vs-triangle interpolation differences without visibly
+    // hovering. Subdivision at ~3 DEM cells keeps chords on the surface.
+    const res = hf.meta.resolution_m
+    const lift = THREE.MathUtils.clamp(1.5 * res, 1, 10)
+    const maxSeg = THREE.MathUtils.clamp(3 * res, 6, 40)
     const pinH = THREE.MathUtils.clamp(size * 0.033, 30, 600)
 
     const liveIds = new Set(this.lastOverlays.map((o) => o.id))
@@ -349,6 +353,11 @@ export class Viewer {
             const mat = new LineMaterial({
               color: new THREE.Color(ov.color).getHex(),
               linewidth: 3.5,
+              // Pull line fragments toward the camera in depth so the small
+              // lift never z-fights the terrain
+              polygonOffset: true,
+              polygonOffsetFactor: -2,
+              polygonOffsetUnits: -4,
             })
             mat.resolution.set(this.canvas.clientWidth, this.canvas.clientHeight)
             this.lineMaterials.push(mat)
@@ -379,7 +388,8 @@ export class Viewer {
           new THREE.SpriteMaterial({ map: tex, sizeAttenuation: true }),
         )
         sprite.center.set(0.5, 0.02)
-        const s = ov.id === this.lastSelected ? pinH * 1.25 : pinH
+        const base = pinH * (ov.scale ?? 1)
+        const s = ov.id === this.lastSelected ? base * 1.25 : base
         sprite.scale.set(s * PIN_ASPECT, s, 1)
         sprite.position.set(x, this.elevToY(hf.heightAt(x, z)), z)
         sprite.userData.overlayId = ov.id
