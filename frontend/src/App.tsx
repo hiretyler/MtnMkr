@@ -171,19 +171,15 @@ export default function App() {
     localStorage.setItem('mtnmkr-units', units)
   }, [units])
 
-  // Summit benchmark. For a named peak, snap to the highest DEM sample
-  // within 200 m of its coordinates - the peak the user asked for, not a
-  // taller neighbor inside the radius (Little Bear vs Blanca). 200 m
-  // absorbs OSM coordinate error but stays under close subsummit spacing
-  // (Little Bear to "South Little Bear" is ~285 m). Raw coordinate loads
-  // mark the area-wide high point instead.
+  // Summit benchmark. For a named peak, hill-climb from its coordinates
+  // to the local maximum - the peak the user asked for, never a taller
+  // neighbor (reaching one would mean descending a saddle first). Raw
+  // coordinate loads mark the area-wide high point instead.
   useEffect(() => {
     const viewer = viewerRef.current
     const hf = viewer?.hf
     if (!meta || !viewer || !hf) return
-    const hp = center?.name
-      ? hf.localHighPoint(center.lon, center.lat, 200)
-      : hf.highPoint()
+    const hp = center?.name ? hf.summitFrom(center.lon, center.lat) : hf.highPoint()
     viewer.setSummit({ lon: hp.lon, lat: hp.lat, elev: hp.elev, label: fmtElev(hp.elev, units) })
   }, [meta, units, center])
 

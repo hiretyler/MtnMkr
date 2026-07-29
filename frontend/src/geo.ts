@@ -57,31 +57,43 @@ export class Heightfield {
   }
 
   /**
-   * Highest sample within radiusM of (lon, lat) - "the summit of the peak
-   * at these coordinates", tolerant of small coordinate error without
-   * jumping to a taller neighbor. Falls back to the area-wide high point
-   * if the coordinates are outside the area.
+   * The summit of the peak at (lon, lat): greedy hill-climb until no
+   * higher cell exists within a 2-cell neighborhood. Unlike a fixed
+   * search window, this cannot jump to a taller neighbor - reaching one
+   * would require descending through the connecting saddle first (The
+   * Prow sits 151 m from Kit Carson Peak; a window search marked Kit
+   * Carson). The 2-cell look-ahead steps over micro-bumps in lidar
+   * grids without crossing real notches. Falls back to the area-wide
+   * high point if the coordinates are outside the area.
    */
-  localHighPoint(
+  summitFrom(
     lon: number,
     lat: number,
-    radiusM: number,
   ): { x: number; z: number; lon: number; lat: number; elev: number } {
     const sc = this.sceneFromLonLat(lon, lat)
     if (!sc) return this.highPoint()
     const { width: W, height: H } = this.meta
-    const gx = Math.round(((sc[0] + this.half) / (2 * this.half)) * (W - 1))
-    const gy = Math.round(((sc[1] + this.half) / (2 * this.half)) * (H - 1))
-    const rx = Math.max(1, Math.ceil(radiusM / ((2 * this.half) / (W - 1))))
-    const ry = Math.max(1, Math.ceil(radiusM / ((2 * this.half) / (H - 1))))
-    let best = -1
-    for (let r = Math.max(0, gy - ry); r <= Math.min(H - 1, gy + ry); r++) {
-      for (let c = Math.max(0, gx - rx); c <= Math.min(W - 1, gx + rx); c++) {
-        const i = r * W + c
-        if (best < 0 || this.data[i] > this.data[best]) best = i
+    let gx = Math.round(((sc[0] + this.half) / (2 * this.half)) * (W - 1))
+    let gy = Math.round(((sc[1] + this.half) / (2 * this.half)) * (H - 1))
+    let cur = gy * W + gx
+    for (let iter = 0; iter < 5000; iter++) {
+      let best = cur
+      for (let dy = -2; dy <= 2; dy++) {
+        const r = gy + dy
+        if (r < 0 || r >= H) continue
+        for (let dx = -2; dx <= 2; dx++) {
+          const c = gx + dx
+          if (c < 0 || c >= W) continue
+          const i = r * W + c
+          if (this.data[i] > this.data[best]) best = i
+        }
       }
+      if (best === cur) break
+      cur = best
+      gy = Math.floor(cur / W)
+      gx = cur % W
     }
-    return this.pointAt(best)
+    return this.pointAt(cur)
   }
 
   sceneFromLonLat(lon: number, lat: number): [number, number] | null {
