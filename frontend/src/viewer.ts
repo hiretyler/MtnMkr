@@ -7,6 +7,13 @@ import { Heightfield } from './geo'
 import { makeNotePinTexture, makePhotoPinTexture, makeSummitTexture, PIN_ASPECT } from './pins'
 import type { AreaMeta, Overlay } from './types'
 
+export interface SummitInfo {
+  lon: number
+  lat: number
+  elev: number
+  label: string
+}
+
 export interface ViewerEvents {
   /** A click landed on bare terrain. */
   onPickTerrain(lon: number, lat: number, elev: number): void
@@ -37,6 +44,7 @@ export class Viewer {
   private pinTextures = new Map<string, THREE.CanvasTexture>()
   private notePinTexture: THREE.CanvasTexture
   private summitTexture: THREE.CanvasTexture | null = null
+  private summit: SummitInfo | null = null
   private raycaster = new THREE.Raycaster()
   private resizeObserver: ResizeObserver
   private textureToken = 0
@@ -247,10 +255,23 @@ export class Viewer {
     this.material.needsUpdate = true
   }
 
-  /** Set (or update) the summit benchmark label; the position is the DEM high point. */
-  setSummitLabel(label: string): void {
-    this.summitTexture?.dispose()
-    this.summitTexture = makeSummitTexture(label)
+  /**
+   * Set (or update/clear) the summit benchmark. The caller decides where
+   * the summit is - the peak the user asked for, not necessarily the
+   * area's highest sample.
+   */
+  setSummit(info: SummitInfo | null): void {
+    if (!info) {
+      this.summit = null
+      this.summitTexture?.dispose()
+      this.summitTexture = null
+    } else {
+      if (!this.summit || this.summit.label !== info.label) {
+        this.summitTexture?.dispose()
+        this.summitTexture = makeSummitTexture(info.label)
+      }
+      this.summit = info
+    }
     this.renderOverlays()
   }
 
@@ -297,17 +318,19 @@ export class Viewer {
       }
     }
 
-    if (this.summitTexture) {
-      const hp = hf.highPoint()
-      const sprite = new THREE.Sprite(
-        new THREE.SpriteMaterial({ map: this.summitTexture, sizeAttenuation: true }),
-      )
-      sprite.center.set(0.5, 0.02)
-      const s = pinH * 0.85
-      sprite.scale.set(s * 2, s, 1)
-      sprite.position.set(hp.x, this.elevToY(hp.elev), hp.z)
-      // Not in pinSprites: the benchmark is terrain furniture, not clickable
-      this.overlayGroup.add(sprite)
+    if (this.summit && this.summitTexture) {
+      const sc = hf.sceneFromLonLat(this.summit.lon, this.summit.lat)
+      if (sc) {
+        const sprite = new THREE.Sprite(
+          new THREE.SpriteMaterial({ map: this.summitTexture, sizeAttenuation: true }),
+        )
+        sprite.center.set(0.5, 0.02)
+        const s = pinH * 0.85
+        sprite.scale.set(s * 2, s, 1)
+        sprite.position.set(sc[0], this.elevToY(this.summit.elev), sc[1])
+        // Not in pinSprites: the benchmark is terrain furniture, not clickable
+        this.overlayGroup.add(sprite)
+      }
     }
 
     for (const ov of this.lastOverlays) {

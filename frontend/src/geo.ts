@@ -34,22 +34,54 @@ export class Heightfield {
     this.half = meta.ground_size_m / 2
   }
 
-  /** The DEM's highest sample - the summit of the modeled area. */
+  private pointAt(i: number): { x: number; z: number; lon: number; lat: number; elev: number } {
+    const { width: W, height: H } = this.meta
+    const r = Math.floor(i / W)
+    const c = i % W
+    const x = -this.half + (c / (W - 1)) * 2 * this.half
+    const z = -this.half + (r / (H - 1)) * 2 * this.half
+    const [lon, lat] = this.lonLatFromScene(x, z)
+    return { x, z, lon, lat, elev: this.data[i] }
+  }
+
+  /** The DEM's highest sample - the high point of the whole modeled area. */
   highPoint(): { x: number; z: number; lon: number; lat: number; elev: number } {
     if (!this.cachedHigh) {
       let best = 0
       for (let i = 1; i < this.data.length; i++) {
         if (this.data[i] > this.data[best]) best = i
       }
-      const { width: W, height: H } = this.meta
-      const r = Math.floor(best / W)
-      const c = best % W
-      const x = -this.half + (c / (W - 1)) * 2 * this.half
-      const z = -this.half + (r / (H - 1)) * 2 * this.half
-      const [lon, lat] = this.lonLatFromScene(x, z)
-      this.cachedHigh = { x, z, lon, lat, elev: this.data[best] }
+      this.cachedHigh = this.pointAt(best)
     }
     return this.cachedHigh
+  }
+
+  /**
+   * Highest sample within radiusM of (lon, lat) - "the summit of the peak
+   * at these coordinates", tolerant of small coordinate error without
+   * jumping to a taller neighbor. Falls back to the area-wide high point
+   * if the coordinates are outside the area.
+   */
+  localHighPoint(
+    lon: number,
+    lat: number,
+    radiusM: number,
+  ): { x: number; z: number; lon: number; lat: number; elev: number } {
+    const sc = this.sceneFromLonLat(lon, lat)
+    if (!sc) return this.highPoint()
+    const { width: W, height: H } = this.meta
+    const gx = Math.round(((sc[0] + this.half) / (2 * this.half)) * (W - 1))
+    const gy = Math.round(((sc[1] + this.half) / (2 * this.half)) * (H - 1))
+    const rx = Math.max(1, Math.ceil(radiusM / ((2 * this.half) / (W - 1))))
+    const ry = Math.max(1, Math.ceil(radiusM / ((2 * this.half) / (H - 1))))
+    let best = -1
+    for (let r = Math.max(0, gy - ry); r <= Math.min(H - 1, gy + ry); r++) {
+      for (let c = Math.max(0, gx - rx); c <= Math.min(W - 1, gx + rx); c++) {
+        const i = r * W + c
+        if (best < 0 || this.data[i] > this.data[best]) best = i
+      }
+    }
+    return this.pointAt(best)
   }
 
   sceneFromLonLat(lon: number, lat: number): [number, number] | null {
