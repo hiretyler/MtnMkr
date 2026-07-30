@@ -202,6 +202,87 @@ export class Heightfield {
   }
 }
 
+/**
+ * Build the terrain mesh geometry for a heightfield: an indexed grid over
+ * ±half with heights baked into y as (h - min_elev) * exag and UVs mapping
+ * row 0 to the top of the draped texture.
+ */
+export function buildTerrainGeometry(hf: Heightfield, exag: number): THREE.BufferGeometry {
+  const { width: W, height: H, min_elev } = hf.meta
+  const half = hf.half
+  const pos = new Float32Array(W * H * 3)
+  const uv = new Float32Array(W * H * 2)
+  for (let r = 0; r < H; r++) {
+    const z = -half + (r / (H - 1)) * 2 * half
+    for (let c = 0; c < W; c++) {
+      const i = r * W + c
+      pos[i * 3] = -half + (c / (W - 1)) * 2 * half
+      pos[i * 3 + 1] = (hf.data[i] - min_elev) * exag
+      pos[i * 3 + 2] = z
+      uv[i * 2] = c / (W - 1)
+      uv[i * 2 + 1] = 1 - r / (H - 1)
+    }
+  }
+  const index = new Uint32Array((W - 1) * (H - 1) * 6)
+  let k = 0
+  for (let r = 0; r < H - 1; r++) {
+    for (let c = 0; c < W - 1; c++) {
+      const a = r * W + c
+      const b = a + 1
+      const d = a + W
+      const e = d + 1
+      index[k++] = a
+      index[k++] = d
+      index[k++] = b
+      index[k++] = b
+      index[k++] = d
+      index[k++] = e
+    }
+  }
+  const geom = new THREE.BufferGeometry()
+  geom.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+  geom.setAttribute('uv', new THREE.BufferAttribute(uv, 2))
+  geom.setIndex(new THREE.BufferAttribute(index, 1))
+  geom.computeVertexNormals()
+  return geom
+}
+
+/**
+ * Project a lon/lat segment into scene space, splitting where it leaves
+ * the area and subdividing long spans so lines drape onto the terrain.
+ */
+export function projectTrackSegment(
+  hf: Heightfield,
+  seg: [number, number, number | null][],
+  maxSeg: number,
+): [number, number][][] {
+  const runs: [number, number][][] = []
+  let current: [number, number][] = []
+  let prev: [number, number] | null = null
+  for (const [lon, lat] of seg) {
+    const sc = hf.sceneFromLonLat(lon, lat)
+    if (!sc) {
+      if (current.length > 1) runs.push(current)
+      current = []
+      prev = null
+      continue
+    }
+    if (prev) {
+      const dx = sc[0] - prev[0]
+      const dz = sc[1] - prev[1]
+      const dist = Math.hypot(dx, dz)
+      const n = Math.floor(dist / maxSeg)
+      for (let i = 1; i <= n; i++) {
+        current.push([prev[0] + (dx * i) / (n + 1), prev[1] + (dz * i) / (n + 1)])
+      }
+    }
+    current.push(sc)
+    prev = sc
+  }
+  if (current.length > 1) runs.push(current)
+  return runs
+}
+
 export function formatDMS(lat: number, lon: number): string {
   const f = (v: number, pos: string, neg: string) => {
     const hemi = v >= 0 ? pos : neg

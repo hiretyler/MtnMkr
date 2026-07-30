@@ -31,6 +31,20 @@ GPS tracks, geotagged photos, and trip notes on top.
 - **Notes**: click-to-place trip report annotations.
 - **Projects**: export/import everything (area, layers, overlays, photos) as a
   single JSON file. The current area is also encoded in the URL hash.
+- **Share as a web page**: "Export page" builds one self-contained `.html` file -
+  terrain, the texture layers you pick, tracks, photos, and notes all embedded -
+  that opens with no server and no network in any browser, straight from
+  `file://`. The viewer inside is the same 3D engine with mobile-first chrome:
+  layer switcher, relief slider, compass, tap-to-measure coordinates/elevation,
+  and tappable pins. Phone-friendly exports downsample the grid to 1024
+  (typical file 3-6 MB); full detail keeps up to 2048 (roughly 10-20 MB with
+  layers). One iOS caveat: tapping an .html file on an iPhone opens Apple's
+  Quick Look preview, which never runs JavaScript - so for iPhones pick the
+  ".epub" format in the same dialog instead. The ePub wraps the identical
+  interactive viewer and opens in Apple Books (preinstalled) with full 3D,
+  orbit/pinch, and tappable pins - AirDrop it and tap. There is also "Export
+  USDZ", which writes the terrain as a native AR Quick Look model - view-only,
+  with the active layer draped, tracks drawn on, and pins as 3D markers.
 
 ## Running it
 

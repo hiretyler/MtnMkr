@@ -9,6 +9,7 @@ backend/cache/
 # Node
 frontend/node_modules/
 frontend/dist/
+frontend/public/standalone-viewer.js
 
 # Personal trip data - never commit tracks, photos, or project exports
 *.gpx
@@ -18,3 +19,4 @@ frontend/dist/
 
 # OS / editor
 .DS_Store
+exports/

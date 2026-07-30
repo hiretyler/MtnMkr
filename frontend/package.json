@@ -4,8 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "npm run build:standalone",
     "dev": "vite",
+    "prebuild": "npm run build:standalone",
     "build": "tsc && vite build",
+    "build:standalone": "vite build -c vite.standalone.config.ts",
     "preview": "vite preview"
   },
   "dependencies": {

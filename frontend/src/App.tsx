@@ -1,7 +1,15 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api'
+import {
+  estimateHeightsBytes,
+  exportStandaloneHtml,
+  TEXTURE_EST_BYTES,
+  VIEWER_BUNDLE_EST_BYTES,
+} from './export'
 import { formatDMS, trackLengthKm } from './geo'
+import { exportStandaloneEpub } from './epub'
 import { parseGpx, parseKml, parseKmz, photoFromFile } from './parsers'
+import { exportUsdz } from './usdz'
 import { peaksOf, type PeakClass } from './peaks'
 import { elevDisplay, elevTickStep, fmtDistKm, fmtElev, fmtRes, type Units } from './units'
 import type {
@@ -52,6 +60,10 @@ export default function App() {
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [lightbox, setLightbox] = useState<string | null>(null)
+  const [exportDialog, setExportDialog] = useState(false)
+  const [exportLayerIds, setExportLayerIds] = useState<string[]>([])
+  const [exportQuality, setExportQuality] = useState<'phone' | 'full'>('phone')
+  const [exportFormat, setExportFormat] = useState<'web' | 'epub'>('web')
 
   const [q, setQ] = useState('')
   const [results, setResults] = useState<SearchResult[]>([])
@@ -163,6 +175,7 @@ export default function App() {
         setSearched(false)
         setPeakIndex(null)
         setLightbox(null)
+        setExportDialog(false)
       }
     }
     window.addEventListener('keydown', onKey)
@@ -446,6 +459,71 @@ export default function App() {
     }
   }
 
+  const openExportDialog = () => {
+    // Fresh dialog state on every open; pre-check the layer on screen
+    setExportLayerIds(layer !== 'shaded' ? [layer] : [])
+    setExportQuality('phone')
+    setExportFormat('web')
+    setExportDialog(true)
+  }
+
+  const toggleExportLayer = (id: string) => {
+    setExportLayerIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    )
+  }
+
+  const exportPage = async () => {
+    const hfNow = viewerRef.current?.hf
+    if (!meta || !center || !hfNow) return
+    setExportDialog(false)
+    setBusy(exportFormat === 'epub' ? 'Building ePub...' : 'Building web page...')
+    try {
+      const exportOpts = {
+        meta,
+        center,
+        heights: hfNow.data,
+        overlays,
+        layerIds: exportLayerIds,
+        gridTarget: exportQuality === 'full' ? meta.width : 1024,
+        textureSize: 2048,
+        units,
+        exaggeration: exag,
+        activeLayer: layer,
+        customLayers,
+      }
+      if (exportFormat === 'epub') await exportStandaloneEpub(exportOpts)
+      else await exportStandaloneHtml(exportOpts)
+    } catch (e) {
+      showError(e)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const exportUsdzFile = async () => {
+    const viewer = viewerRef.current
+    const hfNow = viewer?.hf
+    if (!meta || !center || !viewer || !hfNow) return
+    setBusy('Building USDZ...')
+    try {
+      await exportUsdz({
+        meta,
+        center,
+        heights: hfNow.data,
+        overlays,
+        activeLayer: layer,
+        customLayers,
+        exaggeration: exag,
+        summit: viewer.summitInfo,
+      })
+    } catch (e) {
+      showError(e)
+    } finally {
+      setBusy(null)
+    }
+  }
+
   // ---- derived ----------------------------------------------------------
 
   const classPeaks = useMemo(() => (peakIndex ? peaksOf(peakIndex) : []), [peakIndex])
@@ -499,6 +577,27 @@ export default function App() {
       ),
     )
   }
+
+  /** Ballpark size of the standalone export, for the dialog. */
+  const exportEstMb = useMemo(() => {
+    if (!meta) return 0
+    const grid = exportQuality === 'full' ? meta.width : Math.min(1024, meta.width)
+    let bytes = VIEWER_BUNDLE_EST_BYTES + estimateHeightsBytes(grid)
+    for (const id of exportLayerIds) {
+      bytes +=
+        id === 'topo'
+          ? TEXTURE_EST_BYTES.topo
+          : id === 'imagery'
+            ? TEXTURE_EST_BYTES.imagery
+            : TEXTURE_EST_BYTES.custom
+    }
+    for (const o of overlays) {
+      if (o.kind === 'photo' && o.visible && o.lon != null) {
+        bytes += (o.dataUrl.length * 3) / 4
+      }
+    }
+    return bytes / 1e6
+  }, [meta, exportQuality, exportLayerIds, overlays])
 
   const selected = overlays.find((o) => o.id === selectedId) ?? null
   const hf = viewerRef.current?.hf ?? null
@@ -835,6 +934,12 @@ export default function App() {
               Export
             </button>
             <button onClick={() => projectInput.current?.click()}>Import</button>
+            <button disabled={!meta} onClick={openExportDialog}>
+              Export page
+            </button>
+            <button disabled={!meta} onClick={() => void exportUsdzFile()}>
+              Export USDZ
+            </button>
           </div>
         </section>
 
@@ -1007,6 +1112,91 @@ export default function App() {
           onClick={() => setLightbox(null)}
         >
           <img src={lightbox} alt="" />
+        </div>
+      )}
+
+      {exportDialog && meta && (
+        <div
+          className="export-scrim"
+          role="dialog"
+          aria-label="Export web page"
+          onClick={() => setExportDialog(false)}
+        >
+          <div className="export-dialog" onClick={(e) => e.stopPropagation()}>
+            <h2>Export web page</h2>
+            <div className="export-caption">
+              One self-contained file - works offline, share it anywhere.
+            </div>
+            <span className="export-label">Format</span>
+            <label className="export-check">
+              <input
+                type="radio"
+                name="export-format"
+                checked={exportFormat === 'web'}
+                onChange={() => setExportFormat('web')}
+              />
+              Web page (.html) - any browser
+            </label>
+            <label className="export-check">
+              <input
+                type="radio"
+                name="export-format"
+                checked={exportFormat === 'epub'}
+                onChange={() => setExportFormat('epub')}
+              />
+              Apple Books (.epub) - opens on iPhone/iPad
+            </label>
+            <span className="export-label">Layers</span>
+            <div className="export-muted">Shaded relief is always included.</div>
+            {(
+              [
+                ['topo', 'USGS topo'],
+                ['imagery', 'Satellite (NAIP)'],
+              ] as [string, string][]
+            )
+              .concat(customLayers.map((c) => [`custom:${c.id}`, c.name]))
+              .map(([value, label]) => (
+                <label key={value} className="export-check">
+                  <input
+                    type="checkbox"
+                    checked={exportLayerIds.includes(value)}
+                    onChange={() => toggleExportLayer(value)}
+                  />
+                  {label}
+                </label>
+              ))}
+            <span className="export-label">Quality</span>
+            <label className="export-check">
+              <input
+                type="radio"
+                name="export-quality"
+                checked={exportQuality === 'phone'}
+                onChange={() => setExportQuality('phone')}
+              />
+              Phone-friendly (1024 grid)
+            </label>
+            {meta.width > 1024 && (
+              <>
+                <label className="export-check">
+                  <input
+                    type="radio"
+                    name="export-quality"
+                    checked={exportQuality === 'full'}
+                    onChange={() => setExportQuality('full')}
+                  />
+                  Full detail ({meta.width} grid)
+                </label>
+                <div className="export-muted">Larger file, may strain phones.</div>
+              </>
+            )}
+            <div className="mono export-muted">~{exportEstMb.toFixed(1)} MB</div>
+            <div className="btn-row">
+              <button className="primary" onClick={() => void exportPage()}>
+                Export
+              </button>
+              <button onClick={() => setExportDialog(false)}>Cancel</button>
+            </div>
+          </div>
         </div>
       )}
 

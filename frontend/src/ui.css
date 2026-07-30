@@ -687,6 +687,64 @@ input[type='color'] {
   box-shadow: 6px 6px 0 rgba(0, 0, 0, 0.4);
 }
 
+/* ---- export dialog ---- */
+
+.export-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(42, 33, 24, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.export-dialog {
+  width: 320px;
+  max-width: 92vw;
+  max-height: 92vh;
+  overflow-y: auto;
+  background: var(--paper);
+  border: 1px solid var(--ink);
+  box-shadow: 4px 4px 0 rgba(42, 33, 24, 0.25);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.export-dialog h2 {
+  font-family: 'Barlow Semi Condensed', sans-serif;
+  font-size: 16px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 0;
+}
+
+.export-label {
+  font-family: 'Barlow Semi Condensed', sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-soft);
+  margin-top: 6px;
+}
+
+.export-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.export-caption,
+.export-muted {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
 .ins-name {
   font-weight: 600;
   word-break: break-word;

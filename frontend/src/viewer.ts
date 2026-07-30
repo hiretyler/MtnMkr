@@ -3,7 +3,7 @@ import { MapControls } from 'three/addons/controls/MapControls.js'
 import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
-import { Heightfield } from './geo'
+import { buildTerrainGeometry, Heightfield, projectTrackSegment } from './geo'
 import {
   makeNotePinTexture,
   makePhotoPinTexture,
@@ -130,6 +130,10 @@ export class Viewer {
     return this.exag
   }
 
+  get summitInfo(): SummitInfo | null {
+    return this.summit
+  }
+
   private elevToY(elev: number): number {
     const base = this.hfInternal?.meta.min_elev ?? 0
     return (elev - base) * this.exag
@@ -144,7 +148,7 @@ export class Viewer {
     }
     this.hfInternal = new Heightfield(meta, heights)
 
-    const geom = this.buildGeometry()
+    const geom = buildTerrainGeometry(this.hfInternal, this.exag)
     this.terrain = new THREE.Mesh(geom, this.material)
     this.scene.add(this.terrain)
 
@@ -178,47 +182,6 @@ export class Viewer {
     }
     this.controls.update()
     this.renderOverlays()
-  }
-
-  private buildGeometry(): THREE.BufferGeometry {
-    const hf = this.hfInternal!
-    const { width: W, height: H, min_elev } = hf.meta
-    const half = hf.half
-    const pos = new Float32Array(W * H * 3)
-    const uv = new Float32Array(W * H * 2)
-    for (let r = 0; r < H; r++) {
-      const z = -half + (r / (H - 1)) * 2 * half
-      for (let c = 0; c < W; c++) {
-        const i = r * W + c
-        pos[i * 3] = -half + (c / (W - 1)) * 2 * half
-        pos[i * 3 + 1] = (hf.data[i] - min_elev) * this.exag
-        pos[i * 3 + 2] = z
-        uv[i * 2] = c / (W - 1)
-        uv[i * 2 + 1] = 1 - r / (H - 1)
-      }
-    }
-    const index = new Uint32Array((W - 1) * (H - 1) * 6)
-    let k = 0
-    for (let r = 0; r < H - 1; r++) {
-      for (let c = 0; c < W - 1; c++) {
-        const a = r * W + c
-        const b = a + 1
-        const d = a + W
-        const e = d + 1
-        index[k++] = a
-        index[k++] = d
-        index[k++] = b
-        index[k++] = b
-        index[k++] = d
-        index[k++] = e
-      }
-    }
-    const geom = new THREE.BufferGeometry()
-    geom.setAttribute('position', new THREE.BufferAttribute(pos, 3))
-    geom.setAttribute('uv', new THREE.BufferAttribute(uv, 2))
-    geom.setIndex(new THREE.BufferAttribute(index, 1))
-    geom.computeVertexNormals()
-    return geom
   }
 
   setExaggeration(exag: number): void {
@@ -354,7 +317,7 @@ export class Viewer {
 
       if (ov.kind === 'track') {
         for (const seg of ov.segments) {
-          for (const run of this.projectSegment(seg, maxSeg)) {
+          for (const run of projectTrackSegment(hf, seg, maxSeg)) {
             if (run.length < 2) continue
             const flat: number[] = []
             for (const [x, z] of run) {
@@ -409,42 +372,6 @@ export class Viewer {
         this.overlayGroup.add(sprite)
       }
     }
-  }
-
-  /**
-   * Project a lon/lat segment into scene space, splitting where it leaves
-   * the area and subdividing long spans so lines drape onto the terrain.
-   */
-  private projectSegment(
-    seg: [number, number, number | null][],
-    maxSeg: number,
-  ): [number, number][][] {
-    const hf = this.hfInternal!
-    const runs: [number, number][][] = []
-    let current: [number, number][] = []
-    let prev: [number, number] | null = null
-    for (const [lon, lat] of seg) {
-      const sc = hf.sceneFromLonLat(lon, lat)
-      if (!sc) {
-        if (current.length > 1) runs.push(current)
-        current = []
-        prev = null
-        continue
-      }
-      if (prev) {
-        const dx = sc[0] - prev[0]
-        const dz = sc[1] - prev[1]
-        const dist = Math.hypot(dx, dz)
-        const n = Math.floor(dist / maxSeg)
-        for (let i = 1; i <= n; i++) {
-          current.push([prev[0] + (dx * i) / (n + 1), prev[1] + (dz * i) / (n + 1)])
-        }
-      }
-      current.push(sc)
-      prev = sc
-    }
-    if (current.length > 1) runs.push(current)
-    return runs
   }
 
   // ---- picking ----------------------------------------------------------
