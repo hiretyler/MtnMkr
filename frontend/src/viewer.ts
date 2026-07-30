@@ -4,7 +4,13 @@ import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
 import { Heightfield } from './geo'
-import { makeNotePinTexture, makePhotoPinTexture, makeSummitTexture, PIN_ASPECT } from './pins'
+import {
+  makeNotePinTexture,
+  makePhotoPinTexture,
+  makeSummitTexture,
+  PIN_ASPECT,
+  SUMMIT_ASPECT,
+} from './pins'
 import type { AreaMeta, Overlay } from './types'
 
 export interface SummitInfo {
@@ -12,6 +18,8 @@ export interface SummitInfo {
   lat: number
   elev: number
   label: string
+  /** Peak name shown above the elevation, when the load was a named peak */
+  name?: string | null
 }
 
 export interface ViewerEvents {
@@ -266,9 +274,13 @@ export class Viewer {
       this.summitTexture?.dispose()
       this.summitTexture = null
     } else {
-      if (!this.summit || this.summit.label !== info.label) {
+      if (
+        !this.summit ||
+        this.summit.label !== info.label ||
+        this.summit.name !== info.name
+      ) {
         this.summitTexture?.dispose()
-        this.summitTexture = makeSummitTexture(info.label)
+        this.summitTexture = makeSummitTexture(info.label, info.name)
       }
       this.summit = info
     }
@@ -330,7 +342,7 @@ export class Viewer {
         )
         sprite.center.set(0.5, 0.02)
         const s = pinH * 0.85
-        sprite.scale.set(s * 2, s, 1)
+        sprite.scale.set(s * SUMMIT_ASPECT, s, 1)
         sprite.position.set(sc[0], this.elevToY(this.summit.elev), sc[1])
         // Not in pinSprites: the benchmark is terrain furniture, not clickable
         this.overlayGroup.add(sprite)

@@ -51,6 +51,7 @@ export default function App() {
   const [mode, setMode] = useState<Mode>({ type: 'idle' })
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [lightbox, setLightbox] = useState<string | null>(null)
 
   const [q, setQ] = useState('')
   const [results, setResults] = useState<SearchResult[]>([])
@@ -161,6 +162,7 @@ export default function App() {
         setResults([])
         setSearched(false)
         setPeakIndex(null)
+        setLightbox(null)
       }
     }
     window.addEventListener('keydown', onKey)
@@ -180,7 +182,13 @@ export default function App() {
     const hf = viewer?.hf
     if (!meta || !viewer || !hf) return
     const hp = center?.name ? hf.summitFrom(center.lon, center.lat) : hf.highPoint()
-    viewer.setSummit({ lon: hp.lon, lat: hp.lat, elev: hp.elev, label: fmtElev(hp.elev, units) })
+    viewer.setSummit({
+      lon: hp.lon,
+      lat: hp.lat,
+      elev: hp.elev,
+      label: fmtElev(hp.elev, units),
+      name: center?.name ?? null,
+    })
   }, [meta, units, center])
 
   // Close the search dropdown on any press outside it
@@ -328,10 +336,19 @@ export default function App() {
   }
 
   const addPhotoFiles = async (files: FileList | File[]) => {
+    let firstUnplaced: string | null = null
     let unplaced = 0
+    let dupes = 0
     for (const file of Array.from(files)) {
       try {
         const p = await photoFromFile(file)
+        const exists = overlaysRef.current.some(
+          (o) => o.kind === 'photo' && o.name === p.name && o.dataUrl === p.dataUrl,
+        )
+        if (exists) {
+          dupes++
+          continue
+        }
         const photo: PhotoOverlay = {
           id: uid(),
           kind: 'photo',
@@ -341,15 +358,24 @@ export default function App() {
           lat: p.lat,
           dataUrl: p.dataUrl,
         }
-        if (p.lon == null) unplaced++
+        if (p.lon == null) {
+          unplaced++
+          firstUnplaced ??= photo.id
+        }
         setOverlays((prev) => [...prev, photo])
       } catch (e) {
         showError(e)
       }
     }
-    if (unplaced > 0) {
+    if (dupes > 0) {
+      setError(`Skipped ${dupes} photo${dupes > 1 ? 's' : ''} already in the project.`)
+    }
+    if (firstUnplaced) {
+      // Surface the placement flow: select it so the photo panel with
+      // "Place on terrain" opens immediately
+      setSelectedId(firstUnplaced)
       setError(
-        `${unplaced} photo${unplaced > 1 ? 's have' : ' has'} no GPS tag - select it in the data list and use "Place on terrain".`,
+        `${unplaced > 1 ? `${unplaced} photos have` : 'That photo has'} no GPS tag - use "Place on terrain" in the photo panel, then click the map.`,
       )
     }
   }
@@ -435,7 +461,11 @@ export default function App() {
     setPeakIndex((prev) => (prev === cls ? null : cls))
   }
 
-  /** Overlays grouped by importing file; hand-added items have no source. */
+  /**
+   * Overlays grouped by importing file; hand-added items have no source
+   * and always render first so a freshly added photo or note is never
+   * buried under a long waypoint list.
+   */
   const grouped = useMemo(() => {
     const order: { source: string | null; items: Overlay[] }[] = []
     const index = new Map<string | null, { source: string | null; items: Overlay[] }>()
@@ -449,7 +479,7 @@ export default function App() {
       }
       g.items.push(o)
     }
-    return order
+    return [...order.filter((g) => g.source === null), ...order.filter((g) => g.source !== null)]
   }, [overlays])
 
   const setGroupScale = (source: string, v: number) => {
@@ -498,9 +528,7 @@ export default function App() {
     <div className="app" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
       <aside className="panel">
         <header className="masthead">
-          <div className="eyebrow">Provisional 3D edition</div>
           <h1>MtnMkr</h1>
-          <div className="masthead-sub">Build a better mountain from lidar and your own trips</div>
         </header>
 
         <section>
@@ -780,9 +808,9 @@ export default function App() {
                       {waypoints.length > 0 && (
                         <input
                           type="range"
-                          min={0.3}
+                          min={0.1}
                           max={2}
-                          step={0.1}
+                          step={0.05}
                           value={waypoints[0].scale ?? 1}
                           onChange={(e) =>
                             setGroupScale(g.source!, parseFloat(e.target.value))
@@ -873,7 +901,13 @@ export default function App() {
           <div className="inspector">
             {selected.kind === 'photo' && (
               <>
-                <img src={selected.dataUrl} alt={selected.name} />
+                <img
+                  src={selected.dataUrl}
+                  alt={selected.name}
+                  className="ins-photo"
+                  title="Click to enlarge"
+                  onClick={() => setLightbox(selected.dataUrl)}
+                />
                 <div className="ins-name">{selected.name}</div>
                 {selected.lon != null && selected.lat != null ? (
                   <div className="mono ins-line">
@@ -888,6 +922,22 @@ export default function App() {
                   <button onClick={() => setMode({ type: selected.lon == null ? 'place-photo' : 'move', id: selected.id })}>
                     {selected.lon == null ? 'Place on terrain' : 'Move'}
                   </button>
+                  {selected.lon != null && (
+                    <label className="marker-size" title="Adjust marker size">
+                      <span>Size</span>
+                      <input
+                        type="range"
+                        min={0.1}
+                        max={2}
+                        step={0.05}
+                        value={selected.scale ?? 1}
+                        onChange={(e) =>
+                          updateOverlay(selected.id, { scale: parseFloat(e.target.value) })
+                        }
+                        aria-label="Marker size"
+                      />
+                    </label>
+                  )}
                 </div>
               </>
             )}
@@ -911,6 +961,20 @@ export default function App() {
                 </div>
                 <div className="btn-row">
                   <button onClick={() => setMode({ type: 'move', id: selected.id })}>Move</button>
+                  <label className="marker-size" title="Adjust marker size">
+                    <span>Size</span>
+                    <input
+                      type="range"
+                      min={0.1}
+                      max={2}
+                      step={0.05}
+                      value={selected.scale ?? 1}
+                      onChange={(e) =>
+                        updateOverlay(selected.id, { scale: parseFloat(e.target.value) })
+                      }
+                      aria-label="Marker size"
+                    />
+                  </label>
                 </div>
               </>
             )}
@@ -934,6 +998,17 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {lightbox && (
+        <div
+          className="lightbox"
+          role="dialog"
+          aria-label="Photo at full size"
+          onClick={() => setLightbox(null)}
+        >
+          <img src={lightbox} alt="" />
+        </div>
+      )}
 
       <input
         ref={trackInput}
