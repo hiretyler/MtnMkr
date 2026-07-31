@@ -355,6 +355,13 @@ export class Viewer {
             this.pinTextures.set(ov.id, cached)
           }
           tex = cached
+        } else if (ov.color) {
+          let cached = this.pinTextures.get(ov.id)
+          if (!cached) {
+            cached = makeNotePinTexture(ov.color)
+            this.pinTextures.set(ov.id, cached)
+          }
+          tex = cached
         } else {
           tex = this.notePinTexture
         }

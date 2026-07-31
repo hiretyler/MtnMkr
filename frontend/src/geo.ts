@@ -295,6 +295,116 @@ export function formatDMS(lat: number, lon: number): string {
   return `${f(lat, 'N', 'S')}  ${f(lon, 'E', 'W')}`
 }
 
+/**
+ * Parse a coordinate pair the way people actually paste them.
+ *
+ * Phones and map apps all disagree on format, and someone standing on a
+ * ridge reading numbers off a compass app should not have to convert
+ * anything. Accepts decimal ("40.2548, -105.6162"), degrees-minutes-seconds
+ * ("40°15'17\"N 105°36'58\"W"), and degrees-decimal-minutes ("40°15.28'N
+ * 105 36.97 W"), with or without symbols, hemisphere letters on either
+ * side, and comma or whitespace separators.
+ *
+ * Returns null rather than guessing when the input is ambiguous or out of
+ * range. Latitude is clamped to +-90 by validation, not by silently wrapping.
+ */
+export function parseLatLon(input: string): { lat: number; lon: number } | null {
+  // Normalise the punctuation zoo: typographic quotes, prime marks, the
+  // masculine ordinal that some keyboards produce instead of a degree sign.
+  const s = input
+    .trim()
+    .toUpperCase()
+    .replace(/[º°˚]/g, '°')
+    .replace(/[′’`´]/g, "'")
+    .replace(/[″”“]/g, '"')
+    .replace(/\s+/g, ' ')
+
+  // One component: optional sign, degrees, optional minutes, optional
+  // seconds, optional hemisphere letter (which may also lead).
+  const COMP =
+    "([NSEW])?\\s*([+-]?\\d+(?:\\.\\d+)?)\\s*(?:°|D)?\\s*" +
+    "(?:(\\d+(?:\\.\\d+)?)\\s*(?:'|M)?\\s*" +
+    "(?:(\\d+(?:\\.\\d+)?)\\s*(?:\"|S)?)?)?\\s*([NSEW])?"
+  const m = s.match(new RegExp(`^${COMP}\\s*[, ]\\s*${COMP}$`))
+  if (!m) return null
+
+  const comp = (
+    pre: string | undefined,
+    deg: string,
+    min: string | undefined,
+    sec: string | undefined,
+    post: string | undefined,
+  ): { val: number; hemi: string | null } | null => {
+    const hemi = post || pre || null
+    if (pre && post) return null // "N40N" is not a thing
+    const d = parseFloat(deg)
+    if (!isFinite(d)) return null
+    // A signed value with a hemisphere letter is contradictory input
+    if (hemi && /^[+-]/.test(deg)) return null
+    let val = Math.abs(d) + (min ? parseFloat(min) / 60 : 0) + (sec ? parseFloat(sec) / 3600 : 0)
+    if (min !== undefined && parseFloat(min) >= 60) return null
+    if (sec !== undefined && parseFloat(sec) >= 60) return null
+    if (d < 0) val = -val
+    return { val, hemi }
+  }
+
+  const a = comp(m[1], m[2], m[3], m[4], m[5])
+  const b = comp(m[6], m[7], m[8], m[9], m[10])
+  if (!a || !b) return null
+
+  const apply = (c: { val: number; hemi: string | null }): number =>
+    c.hemi === 'S' || c.hemi === 'W' ? -Math.abs(c.val) : c.val
+
+  let lat: number
+  let lon: number
+  const aIsLon = a.hemi === 'E' || a.hemi === 'W'
+  const bIsLat = b.hemi === 'N' || b.hemi === 'S'
+  if (aIsLon || bIsLat) {
+    // Written lon-first ("105W 40N"); rare, but unambiguous when labelled
+    lon = apply(a)
+    lat = apply(b)
+  } else {
+    lat = apply(a)
+    lon = apply(b)
+  }
+
+  if (!isFinite(lat) || !isFinite(lon)) return null
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null
+  return { lat, lon }
+}
+
+/** Great-circle distance in km between two lon/lat points. */
+export function distanceKm(lon1: number, lat1: number, lon2: number, lat2: number): number {
+  const dLat = ((lat2 - lat1) * Math.PI) / 180
+  const dLon = ((lon2 - lon1) * Math.PI) / 180
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2
+  return (2 * R * Math.asin(Math.sqrt(a))) / 1000
+}
+
+/** Initial true bearing in degrees (0 = north) from point 1 to point 2. */
+export function bearingDeg(lon1: number, lat1: number, lon2: number, lat2: number): number {
+  const p1 = (lat1 * Math.PI) / 180
+  const p2 = (lat2 * Math.PI) / 180
+  const dl = ((lon2 - lon1) * Math.PI) / 180
+  const y = Math.sin(dl) * Math.cos(p2)
+  const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl)
+  return (((Math.atan2(y, x) * 180) / Math.PI) + 360) % 360
+}
+
+const COMPASS_POINTS = [
+  'N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+  'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW',
+]
+
+/** Bearing as a 16-point compass label ("NNE"). */
+export function compassPoint(deg: number): string {
+  return COMPASS_POINTS[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16]
+}
+
 export function trackLengthKm(segments: [number, number, number | null][][]): number {
   let total = 0
   for (const seg of segments) {

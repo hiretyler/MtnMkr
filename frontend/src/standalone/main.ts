@@ -2,8 +2,15 @@
 // exported html, decodes the heightfield, and drives the shared Viewer
 // with vanilla DOM chrome. No React, no network - everything it needs
 // ships inside the one file.
-import { formatDMS, trackLengthKm } from '../geo'
-import type { Overlay } from '../types'
+import {
+  bearingDeg,
+  compassPoint,
+  distanceKm,
+  formatDMS,
+  parseLatLon,
+  trackLengthKm,
+} from '../geo'
+import type { NoteOverlay, Overlay } from '../types'
 import { fmtDistKm, fmtElev, fmtRes, type Units } from '../units'
 import { Viewer } from '../viewer'
 import { decodeHeights } from './codec'
@@ -23,6 +30,10 @@ const COMPASS_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44"
   <polygon points="22,15 17,23 27,23" fill="#7a4a21" stroke="#2a2118" stroke-width="1" />
   <polygon points="17,23 27,23 22,31" fill="#f6f2e8" stroke="#2a2118" stroke-width="1" />
 </svg>`
+
+// Overlay id for the user-entered "you are here" marker. Fixed so setting a
+// position twice moves the existing pin instead of stacking new ones.
+const HERE_ID = '__here__'
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -93,9 +104,26 @@ function bootInner(app: HTMLElement): void {
         <button class="compass" title="Face north" aria-label="Face north">
           <div class="rose">${COMPASS_SVG}</div>
         </button>
+        <button class="here-btn" title="Mark my position" aria-label="Mark my position">◎</button>
         <div class="hud mono">Drag to orbit · pinch to zoom · tap terrain to measure</div>
         <button class="toast" hidden=""></button>
         <div class="card" hidden=""></div>
+        <div class="here-panel" hidden="">
+          <button class="here-close" aria-label="Close">×</button>
+          <div class="here-title">Mark my position</div>
+          <p class="here-help">
+            Paste coordinates from your phone's compass or map app. Decimal or
+            degrees-minutes-seconds both work.
+          </p>
+          <input class="here-input" type="text" inputmode="text"
+                 placeholder="40.2548, -105.6162" aria-label="Coordinates" />
+          <div class="here-actions">
+            <button class="here-set">Place</button>
+            <button class="here-gps" hidden="">Use GPS</button>
+            <button class="here-clear" hidden="">Clear</button>
+          </div>
+          <div class="here-msg mono"></div>
+        </div>
       </main>
       <footer class="bottombar">
         <div class="layers"></div>
@@ -314,7 +342,22 @@ function bootInner(app: HTMLElement): void {
 
     if (ov) {
       card.appendChild(el('div', 'card-name', ov.name))
-      if (ov.kind === 'photo') {
+      if (ov.id === HERE_ID && ov.kind === 'note') {
+        card.appendChild(coordLine(ov.lon, ov.lat))
+        // Derived here rather than stored, so the units toggle updates it
+        const d = distanceKm(ov.lon, ov.lat, hp.lon, hp.lat)
+        if (d > 0.02) {
+          const b = compassPoint(bearingDeg(ov.lon, ov.lat, hp.lon, hp.lat))
+          card.appendChild(
+            el(
+              'div',
+              'card-line mono',
+              `${fmtDistKm(d, units)} ${b} to ${payload.center.name ?? 'summit'}`,
+            ),
+          )
+        }
+        card.appendChild(unitsToggle())
+      } else if (ov.kind === 'photo') {
         const img = el('img', 'card-photo')
         img.src = ov.dataUrl
         img.alt = ov.name
@@ -342,6 +385,121 @@ function bootInner(app: HTMLElement): void {
       if (elev != null) card.appendChild(el('div', 'card-elev', fmtElev(elev, units)))
       card.appendChild(unitsToggle())
     }
+  }
+
+  // ---- my position ------------------------------------------------------
+  //
+  // Typed, not sensed. navigator.geolocation needs a secure context, and a
+  // file:// page (the whole point of this export) is not one - so on a phone
+  // opened from Files, AirDrop, or Books there is no GPS to read. Entering
+  // coordinates from the phone's own compass app works everywhere and needs
+  // no permission. The GPS button below appears only when the page happens
+  // to be served over https, where the API does work.
+
+  const hereBtn = $('.here-btn') as HTMLButtonElement
+  const herePanel = $('.here-panel')
+  const hereInput = $('.here-input') as HTMLInputElement
+  const hereMsg = $('.here-msg')
+  const hereClear = $('.here-clear') as HTMLButtonElement
+  const hereGps = $('.here-gps') as HTMLButtonElement
+
+  function hereOverlay(): NoteOverlay | undefined {
+    return overlays.find((o) => o.id === HERE_ID) as NoteOverlay | undefined
+  }
+
+  function setHere(lon: number, lat: number): boolean {
+    // Outside the exported tile there is no terrain to pin it to
+    if (!viewer.hf?.sceneFromLonLat(lon, lat)) return false
+    const existing = hereOverlay()
+    if (existing) {
+      existing.lon = lon
+      existing.lat = lat
+    } else {
+      overlays.push({
+        id: HERE_ID,
+        kind: 'note',
+        name: 'My position',
+        visible: true,
+        lon,
+        lat,
+        // Body is derived at render time so it tracks the units toggle
+        body: '',
+        color: '#B0413E',
+      })
+    }
+    selectedId = HERE_ID
+    measure = null
+    viewer.setOverlays(overlays, selectedId)
+    renderCard()
+    hereClear.hidden = false
+    return true
+  }
+
+  function clearHere(): void {
+    const i = overlays.findIndex((o) => o.id === HERE_ID)
+    if (i >= 0) overlays.splice(i, 1)
+    if (selectedId === HERE_ID) selectedId = null
+    viewer.setOverlays(overlays, selectedId)
+    renderCard()
+    hereClear.hidden = true
+    hereMsg.textContent = ''
+    hereInput.value = ''
+  }
+
+  function openHere(): void {
+    herePanel.hidden = false
+    hereClear.hidden = !hereOverlay()
+    hereInput.focus()
+  }
+
+  hereBtn.addEventListener('click', () => {
+    if (herePanel.hidden) openHere()
+    else herePanel.hidden = true
+  })
+  ;($('.here-close') as HTMLButtonElement).addEventListener('click', () => {
+    herePanel.hidden = true
+  })
+
+  function commitHere(): void {
+    const parsed = parseLatLon(hereInput.value)
+    if (!parsed) {
+      hereMsg.textContent = 'Could not read that. Try "40.2548, -105.6162".'
+      return
+    }
+    if (!setHere(parsed.lon, parsed.lat)) {
+      hereMsg.textContent = 'That point is outside this map.'
+      return
+    }
+    hereMsg.textContent = ''
+    herePanel.hidden = true
+  }
+
+  ;($('.here-set') as HTMLButtonElement).addEventListener('click', commitHere)
+  hereInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') commitHere()
+  })
+  hereClear.addEventListener('click', clearHere)
+
+  // Only offered where it can actually work: https, not file://
+  if (window.isSecureContext && navigator.geolocation) {
+    hereGps.hidden = false
+    hereGps.addEventListener('click', () => {
+      hereMsg.textContent = 'Locating…'
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          if (setHere(pos.coords.longitude, pos.coords.latitude)) {
+            hereMsg.textContent = ''
+            herePanel.hidden = true
+          } else {
+            hereMsg.textContent = 'You are outside this map.'
+          }
+        },
+        (err) => {
+          hereMsg.textContent = `GPS unavailable (${err.message}).`
+        },
+        { enableHighAccuracy: true, timeout: 10000 },
+      )
+    })
   }
 
   // ---- lightbox ---------------------------------------------------------
