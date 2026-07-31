@@ -25,6 +25,20 @@ const SHELL_FILES = __PRECACHE_MANIFEST__
 const API_BASE = '__API_BASE__'
 const API_ORIGIN = API_BASE ? new URL(API_BASE, self.location.href).origin : self.location.origin
 
+// Where pre-baked tiles are published, if anywhere.
+const PREBAKE_BASE = '__PREBAKE_BASE__'
+const PREBAKE_ORIGIN = PREBAKE_BASE ? new URL(PREBAKE_BASE, self.location.href).origin : ''
+
+// With no backend the browser fetches elevation and imagery from USGS itself,
+// so these have to be cacheable too - otherwise the offline story would work
+// only for deployments that happen to have a proxy in front. Both send
+// Access-Control-Allow-Origin: *, so the responses are real (not opaque) and
+// can be stored and replayed.
+const USGS_ORIGINS = [
+  'https://elevation.nationalmap.gov',
+  'https://basemap.nationalmap.gov',
+]
+
 const SHELL_CACHE = 'mtnmkr-shell-' + VERSION
 const DATA_CACHE = 'mtnmkr-data-v1'
 
@@ -46,6 +60,10 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
+      // Sweep every shell but this one. Deployed back to back, an older
+      // worker can be replaced before its own activate ran, leaving its cache
+      // behind - so sweep on every activation rather than assuming each
+      // version cleaned up after itself.
       const names = await caches.keys()
       await Promise.all(
         names
@@ -75,6 +93,11 @@ function isTerrainData(url) {
     if (/\/api\/area\/[^/]+\/(heights|texture|layers)/.test(url.pathname)) return true
     if (/\/api\/area\/[^/]+$/.test(url.pathname)) return true
   }
+  // A 3DEP or basemap export is fully determined by its query string, so the
+  // request URL is a sound cache key even though it is not a tidy path.
+  if (USGS_ORIGINS.includes(url.origin)) return true
+  // Pre-baked tiles are content-addressed and immutable.
+  if (PREBAKE_ORIGIN && url.origin === PREBAKE_ORIGIN) return true
   // Only fetched when the user exports; runtime-cached so exports keep
   // working offline once they have been used at least once.
   return url.origin === self.location.origin && url.pathname.endsWith('/standalone-viewer.js')
@@ -94,7 +117,14 @@ self.addEventListener('fetch', (event) => {
   if (request.method !== 'GET') return // area builds and uploads need the network
 
   const url = new URL(request.url)
-  if (url.origin !== self.location.origin && url.origin !== API_ORIGIN) return
+  if (
+    url.origin !== self.location.origin &&
+    url.origin !== API_ORIGIN &&
+    url.origin !== PREBAKE_ORIGIN &&
+    !USGS_ORIGINS.includes(url.origin)
+  ) {
+    return
+  }
 
   // Navigations: network first so a deploy is picked up, falling back to the
   // cached shell so a reload with no signal still boots.

@@ -12,8 +12,18 @@ export function onUpdateReady(fn: () => void): void {
   if (waiting) fn()
 }
 
+const APPLIED_FLAG = 'mtnmkr-update-applied'
+
 /** Reload onto the new version. Safe to call only from a user gesture. */
 export function applyUpdate(): void {
+  // Survives the reload so the next load knows not to re-announce an update
+  // it already applied. Without it the banner latches again: the outgoing
+  // worker can still read as "waiting" for a moment on the fresh page.
+  try {
+    sessionStorage.setItem(APPLIED_FLAG, '1')
+  } catch {
+    /* private mode - worst case the banner shows once more */
+  }
   if (!waiting) {
     location.reload()
     return
@@ -43,11 +53,19 @@ export function registerServiceWorker(): void {
   if (import.meta.env.DEV) return
   if (!window.isSecureContext) return
 
+  let justApplied = false
+  try {
+    justApplied = sessionStorage.getItem(APPLIED_FLAG) === '1'
+    if (justApplied) sessionStorage.removeItem(APPLIED_FLAG)
+  } catch {
+    /* private mode */
+  }
+
   window.addEventListener('load', () => {
     navigator.serviceWorker
       .register('sw.js')
       .then((reg) => {
-        if (reg.waiting) {
+        if (reg.waiting && !justApplied) {
           waiting = reg.waiting
           onUpdate?.()
         }

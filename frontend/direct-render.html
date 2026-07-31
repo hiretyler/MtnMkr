@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>MtnMkr - client-side render</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #ded8ca; }
+      #wrap { display: flex; flex-direction: column; height: 100%; }
+      #bar { font: 13px ui-monospace, monospace; padding: 8px 12px; background: #f4f1ea; }
+      canvas { flex: 1; display: block; width: 100%; }
+    </style>
+  </head>
+  <body>
+    <div id="wrap">
+      <div id="bar">building...</div>
+      <canvas id="c"></canvas>
+    </div>
+    <script type="module">
+      import { buildArea, textureUrl } from './src/direct/usgs.ts'
+      import { search } from './src/direct/gazetteer.ts'
+      import { Viewer } from './src/viewer.ts'
+
+      const bar = document.getElementById('bar')
+      const t0 = performance.now()
+
+      // Everything below happens with no backend involved at all.
+      const hits = await search('crestone needle', '/gnis_terrain.tsv.gz')
+      const peak = hits[0]
+      bar.textContent = `found "${peak.name}" - fetching 3DEP...`
+
+      const { meta, heights, bbox } = await buildArea(peak.lat, peak.lon, 4, 1024, peak.name)
+
+      const viewer = new Viewer(document.getElementById('c'), {
+        onPickTerrain: () => {},
+        onSelectOverlay: () => {},
+        onHeadingChange: () => {},
+      })
+      viewer.setTerrain(meta, heights)
+      viewer.setExaggeration(1)
+
+      const hp = viewer.hf.summitFrom(peak.lon, peak.lat)
+      viewer.setSummit({
+        lon: hp.lon,
+        lat: hp.lat,
+        elev: hp.elev,
+        label: `${Math.round(hp.elev * 3.28084).toLocaleString()} ft`,
+        name: peak.name.split(',')[0],
+      })
+
+      await viewer.setTextureUrl(textureUrl(bbox, 'topo', 2048))
+
+      bar.textContent =
+        `${peak.name} · summit ${Math.round(hp.elev * 3.28084).toLocaleString()} ft · ` +
+        `${meta.resolution_m.toFixed(1)} m/px · built client-side in ` +
+        `${((performance.now() - t0) / 1000).toFixed(1)}s · NO BACKEND`
+    </script>
+  </body>
+</html>

@@ -33,8 +33,14 @@ function serviceWorker(): Plugin {
         .replaceAll('__CACHE_VERSION__', version)
         .replaceAll('__PRECACHE_MANIFEST__', JSON.stringify(manifest, null, 2))
         .replaceAll('__API_BASE__', process.env.VITE_API_BASE ?? '')
+        .replaceAll('__PREBAKE_BASE__', process.env.VITE_PREBAKE_BASE ?? '')
 
-      for (const token of ['__CACHE_VERSION__', '__PRECACHE_MANIFEST__', '__API_BASE__']) {
+      for (const token of [
+        '__CACHE_VERSION__',
+        '__PRECACHE_MANIFEST__',
+        '__API_BASE__',
+        '__PREBAKE_BASE__',
+      ]) {
         if (src.includes(token)) this.error(`sw-template.js still contains ${token}`)
       }
       this.emitFile({ type: 'asset', fileName: 'sw.js', source: src })

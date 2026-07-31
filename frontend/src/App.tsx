@@ -19,6 +19,8 @@ import {
   storageInfo,
   type StorageInfo,
 } from './store'
+import { loadArea, reloadArea, type TerrainSource } from './direct/source'
+import { search as gazetteerSearch } from './direct/gazetteer'
 import { applyUpdate, clearCachedTerrain, onUpdateReady } from './sw-client'
 import { elevDisplay, elevTickStep, fmtDistKm, fmtElev, fmtRes, type Units } from './units'
 import type {
@@ -56,6 +58,9 @@ function shortName(displayName: string): string {
   return displayName.split(',')[0].trim()
 }
 
+/** Static asset, so it moves with the app's base path under a subdirectory. */
+const GAZETTEER_URL = `${import.meta.env.BASE_URL}gnis_terrain.tsv.gz`
+
 function fmtBytes(n: number): string {
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`
   if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(0)} MB`
@@ -89,6 +94,10 @@ export default function App() {
   const [offline, setOffline] = useState(!navigator.onLine)
   const [updateReady, setUpdateReady] = useState(false)
   const [storage, setStorage] = useState<StorageInfo | null>(null)
+  // Absolute texture URLs for the current area - pre-baked, backend, or
+  // straight from USGS. The layer effect no longer needs to know which.
+  const [textures, setTextures] = useState<{ topo: string; imagery: string } | null>(null)
+  const [terrainSource, setTerrainSource] = useState<TerrainSource | null>(null)
   // Off by default: worldwide search leaves the bundled public-domain index
   // and hits komoot's Photon demo API, whose terms only cover light use.
   const [worldwide, setWorldwide] = useState(false)
@@ -109,6 +118,15 @@ export default function App() {
   const trackCount = useRef(0)
   const searchWrapRef = useRef<HTMLDivElement>(null)
   const roseRef = useRef<HTMLDivElement>(null)
+
+  // Probed once. A deployment with no backend simply resolves to null, and
+  // everything that needs one (GeoTIFF upload, worldwide search) hides itself.
+  const capsRef = useRef<Promise<Capabilities | null>>(
+    api.fetchCapabilities().then(
+      (c) => c,
+      () => null,
+    ),
+  )
 
   const showError = useCallback((e: unknown) => {
     setError(e instanceof Error ? e.message : String(e))
@@ -176,13 +194,13 @@ export default function App() {
     if (layer === 'shaded') {
       viewer.setShaded()
     } else if (layer === 'topo' || layer === 'imagery') {
-      viewer.setTextureUrl(api.textureUrl(meta.id, layer)).catch(showError)
+      if (textures) viewer.setTextureUrl(textures[layer]).catch(showError)
     } else {
       const id = layer.slice('custom:'.length)
       const cl = customLayers.find((c) => c.id === id)
       if (cl) viewer.setTextureUrl(cl.url).catch(showError)
     }
-  }, [layer, meta, customLayers, showError])
+  }, [layer, meta, textures, customLayers, showError])
 
   useEffect(() => {
     if (!error) return
@@ -247,13 +265,14 @@ export default function App() {
       const radius = r ?? radiusKm
       const px = s ?? size
       setCenter({ lat, lon, name })
-      setBusy('Requesting elevation from USGS 3DEP (first load can take a minute)...')
+      setBusy('Locating terrain...')
       try {
-        const m = await api.createArea({ lat, lon, radius_km: radius, size: px, name })
-        setBusy('Downloading heightmap...')
-        const heights = await api.fetchHeights(m.id)
-        viewerRef.current?.setTerrain(m, heights)
+        const got = await loadArea(lat, lon, radius, px, name, await capsRef.current, setBusy)
+        const m = got.meta
+        viewerRef.current?.setTerrain(m, got.heights)
         setMeta(m)
+        setTextures(got.textures)
+        setTerrainSource(got.source)
         setCustomLayers([])
         if (layer.startsWith('custom:')) setLayer('shaded')
         const hash = `lat=${lat.toFixed(5)}&lon=${lon.toFixed(5)}&r=${radius}&s=${px}${
@@ -280,9 +299,11 @@ export default function App() {
       setCenter({ lat: m.lat, lon: m.lon, name })
       setBusy('Loading cached terrain...')
       try {
-        const heights = await api.fetchHeights(m.id)
-        viewerRef.current?.setTerrain(m, heights)
-        setMeta(m)
+        const got = await reloadArea(m, await capsRef.current)
+        viewerRef.current?.setTerrain(got.meta, got.heights)
+        setMeta(got.meta)
+        setTextures(got.textures)
+        setTerrainSource(got.source)
         const hash = `lat=${m.lat.toFixed(5)}&lon=${m.lon.toFixed(5)}&r=${m.radius_km}&s=${
           m.size
         }${name ? `&name=${encodeURIComponent(name)}` : ''}`
@@ -406,7 +427,7 @@ export default function App() {
   // without GDAL, so the GeoTIFF control is feature-detected rather than
   // offered unconditionally and failing server-side.
   useEffect(() => {
-    api.fetchCapabilities().then(setCaps, () => setCaps(null))
+    capsRef.current.then(setCaps)
   }, [])
 
   const onSearch = async (e: React.FormEvent) => {
@@ -424,7 +445,13 @@ export default function App() {
     setResults([])
     setSearched(false)
     try {
-      setResults(await api.search(query, worldwide))
+      // Worldwide search is the only query that still needs a server; the
+      // bundled gazetteer covers the US in-browser and works offline.
+      setResults(
+        worldwide && caps
+          ? await api.search(query, true)
+          : await gazetteerSearch(query, GAZETTEER_URL),
+      )
       setSearched(true)
     } catch (err) {
       showError(err)
@@ -813,7 +840,7 @@ export default function App() {
                 {searching ? '...' : 'Find'}
               </button>
             </form>
-            <label className="worldwide-row">
+            <label className="worldwide-row" hidden={!caps}>
               <input
                 type="checkbox"
                 checked={worldwide}
@@ -975,7 +1002,9 @@ export default function App() {
                 </label>
               ))}
           </div>
-          {caps?.geotiff !== false && (
+          {/* Only when a backend actually reported it. A null caps means no
+              backend at all, and the upload would have nowhere to go. */}
+          {caps?.geotiff === true && (
             <button disabled={!meta} onClick={() => tiffInput.current?.click()}>
               Add GeoTIFF layer
             </button>

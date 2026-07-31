@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>MtnMkr - direct-to-USGS check</title>
+    <style>
+      body {
+        font: 14px/1.5 ui-monospace, monospace;
+        margin: 24px;
+        max-width: 900px;
+      }
+      pre {
+        background: #f4f1ea;
+        padding: 12px;
+        white-space: pre-wrap;
+      }
+      .ok {
+        color: #2b6a3f;
+      }
+      .bad {
+        color: #a32b2b;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Direct-to-USGS check</h1>
+    <p>
+      Builds an area entirely in the browser and compares it against the same area built by the
+      FastAPI backend. Serve this from the Vite dev server so <code>/api</code> proxies through.
+    </p>
+    <pre id="out">running...</pre>
+    <script type="module">
+      import { buildArea, areaId, textureUrl } from './src/direct/usgs.ts'
+
+      const out = document.getElementById('out')
+      const log = (s, cls) =>
+        (out.innerHTML += cls ? `<span class="${cls}">${s}</span>\n` : s + '\n')
+
+      // Little Bear Peak, the area already cached by the backend
+      const LAT = 37.56672,
+        LON = -105.49724,
+        R = 4,
+        SIZE = 512
+
+      try {
+        log('--- client-side build ---')
+        let t0 = performance.now()
+        const { meta, heights, bbox } = await buildArea(LAT, LON, R, SIZE, 'Little Bear Peak')
+        const clientMs = Math.round(performance.now() - t0)
+        log(`built in ${clientMs} ms`)
+        log(`id           ${meta.id}`)
+        log(`grid         ${meta.width}x${meta.height}`)
+        log(`resolution   ${meta.resolution_m.toFixed(4)} m`)
+        log(`elev range   ${meta.min_elev.toFixed(3)} .. ${meta.max_elev.toFixed(3)}`)
+
+        log('\n--- server-side build (same params) ---')
+        t0 = performance.now()
+        const sMeta = await fetch('/api/area', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            lat: LAT,
+            lon: LON,
+            radius_km: R,
+            size: SIZE,
+            name: 'Little Bear Peak',
+          }),
+        }).then((r) => r.json())
+        const sHeights = new Float32Array(
+          await fetch(`/api/area/${sMeta.id}/heights`).then((r) => r.arrayBuffer()),
+        )
+        log(`fetched in ${Math.round(performance.now() - t0)} ms`)
+        log(`id           ${sMeta.id}`)
+        log(`elev range   ${sMeta.min_elev.toFixed(3)} .. ${sMeta.max_elev.toFixed(3)}`)
+
+        log('\n--- comparison ---')
+        const idMatch = meta.id === sMeta.id
+        log(`area id match          ${idMatch}`, idMatch ? 'ok' : 'bad')
+        const lenMatch = heights.length === sHeights.length
+        log(`sample count match     ${lenMatch} (${heights.length})`, lenMatch ? 'ok' : 'bad')
+
+        let maxDiff = 0,
+          diffs = 0
+        for (let i = 0; i < Math.min(heights.length, sHeights.length); i++) {
+          const d = Math.abs(heights[i] - sHeights[i])
+          if (d > 0) diffs++
+          if (d > maxDiff) maxDiff = d
+        }
+        log(`differing samples      ${diffs}`, diffs === 0 ? 'ok' : 'bad')
+        log(`max abs difference     ${maxDiff}`, maxDiff === 0 ? 'ok' : 'bad')
+
+        const bboxMatch = bbox.every((v, i) => Math.abs(v - sMeta.bbox3857[i]) < 1e-6)
+        log(`bbox match             ${bboxMatch}`, bboxMatch ? 'ok' : 'bad')
+        const resMatch = Math.abs(meta.resolution_m - sMeta.resolution_m) < 1e-9
+        log(`resolution match       ${resMatch}`, resMatch ? 'ok' : 'bad')
+
+        log('\n--- texture reachability (cross-origin, no proxy) ---')
+        for (const layer of ['topo', 'imagery']) {
+          const u = textureUrl(bbox, layer, 512)
+          const r = await fetch(u)
+          const b = await r.blob()
+          log(
+            `${layer.padEnd(8)} ${r.status} ${b.type} ${(b.size / 1024).toFixed(0)} KB`,
+            r.ok ? 'ok' : 'bad',
+          )
+        }
+
+        const allOk = idMatch && lenMatch && diffs === 0 && bboxMatch && resMatch
+        log(
+          `\n${allOk ? 'PASS - client build is byte-identical to the server build' : 'FAIL'}`,
+          allOk ? 'ok' : 'bad',
+        )
+      } catch (e) {
+        log(`\nERROR: ${e && e.message ? e.message : e}`, 'bad')
+        console.error(e)
+      }
+    </script>
+  </body>
+</html>
