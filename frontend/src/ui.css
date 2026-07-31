@@ -129,6 +129,16 @@ textarea {
   margin-bottom: 2px;
 }
 
+.panel h3 {
+  font-family: 'Barlow Semi Condensed', sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-soft);
+  margin: 4px 0 2px;
+}
+
 .credits {
   padding: 12px 0;
   color: var(--ink-soft);
@@ -332,6 +342,70 @@ input[type='color'] {
 
 .index-row button {
   padding: 4px 10px;
+}
+
+/* ---- offline / update ---- */
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  border-left: 3px solid var(--contour);
+  background: var(--paper-sunken);
+  color: var(--ink-soft);
+}
+
+.banner button {
+  margin-left: auto;
+  flex: none;
+  padding: 3px 9px;
+}
+
+.update-banner {
+  border-left-color: var(--water);
+}
+
+.offline-note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+
+.offline-stat {
+  font-size: 11px;
+  color: var(--ink-soft);
+}
+
+.worldwide-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.worldwide-row input {
+  accent-color: var(--contour);
+  width: auto;
+  margin: 0;
+  cursor: pointer;
+}
+
+.worldwide-note {
+  margin: 6px 0 0;
+  padding: 7px 9px;
+  border-left: 2px solid var(--contour);
+  background: var(--paper-sunken);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ink-soft);
 }
 
 .results li + li {

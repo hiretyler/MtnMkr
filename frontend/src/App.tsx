@@ -11,10 +11,20 @@ import { exportStandaloneEpub } from './epub'
 import { parseGpx, parseKml, parseKmz, photoFromFile } from './parsers'
 import { exportUsdz } from './usdz'
 import { peaksOf, type PeakClass } from './peaks'
+import {
+  clearSession,
+  loadSession,
+  requestPersistence,
+  saveSession,
+  storageInfo,
+  type StorageInfo,
+} from './store'
+import { applyUpdate, clearCachedTerrain, onUpdateReady } from './sw-client'
 import { elevDisplay, elevTickStep, fmtDistKm, fmtElev, fmtRes, type Units } from './units'
 import type {
   AreaMeta,
   BaseLayer,
+  Capabilities,
   CustomLayer,
   NoteOverlay,
   Overlay,
@@ -46,6 +56,12 @@ function shortName(displayName: string): string {
   return displayName.split(',')[0].trim()
 }
 
+function fmtBytes(n: number): string {
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(0)} MB`
+  return `${(n / 1073741824).toFixed(1)} GB`
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const viewerRef = useRef<Viewer | null>(null)
@@ -69,6 +85,13 @@ export default function App() {
   const [results, setResults] = useState<SearchResult[]>([])
   const [searching, setSearching] = useState(false)
   const [searched, setSearched] = useState(false)
+  const [caps, setCaps] = useState<Capabilities | null>(null)
+  const [offline, setOffline] = useState(!navigator.onLine)
+  const [updateReady, setUpdateReady] = useState(false)
+  const [storage, setStorage] = useState<StorageInfo | null>(null)
+  // Off by default: worldwide search leaves the bundled public-domain index
+  // and hits komoot's Photon demo API, whose terms only cover light use.
+  const [worldwide, setWorldwide] = useState(false)
   const [peakIndex, setPeakIndex] = useState<PeakClass | null>(null)
   const [units, setUnits] = useState<Units>(() =>
     localStorage.getItem('mtnmkr-units') === 'imperial' ? 'imperial' : 'metric',
@@ -247,8 +270,38 @@ export default function App() {
     [radiusKm, size, layer, showError],
   )
 
+  /**
+   * Re-open an already-resolved area without asking the server to resolve it
+   * again. The heightmap request is a GET the service worker can serve from
+   * cache, so this is the path that works with no signal.
+   */
+  const restoreArea = useCallback(
+    async (m: AreaMeta, name: string | null) => {
+      setCenter({ lat: m.lat, lon: m.lon, name })
+      setBusy('Loading cached terrain...')
+      try {
+        const heights = await api.fetchHeights(m.id)
+        viewerRef.current?.setTerrain(m, heights)
+        setMeta(m)
+        const hash = `lat=${m.lat.toFixed(5)}&lon=${m.lon.toFixed(5)}&r=${m.radius_km}&s=${
+          m.size
+        }${name ? `&name=${encodeURIComponent(name)}` : ''}`
+        lastHashRef.current = hash
+        location.hash = hash
+      } catch (e) {
+        showError(e)
+      } finally {
+        setBusy(null)
+      }
+    },
+    [showError],
+  )
+
   const didInit = useRef(false)
   const lastHashRef = useRef('')
+  // Suppresses the persistence write until the restore pass has run, so an
+  // empty initial state cannot clobber a saved session before it loads.
+  const restored = useRef(false)
   const loadFromHash = useCallback(() => {
     const p = new URLSearchParams(location.hash.slice(1))
     const lat = parseFloat(p.get('lat') ?? '')
@@ -261,11 +314,82 @@ export default function App() {
     void loadAreaAt(lat, lon, p.get('name'), r, s)
   }, [loadAreaAt])
 
+  // Boot: restore the saved session, then let the URL hash win on the area if
+  // it names one. Overlays are restored either way - tracks and photos belong
+  // to the trip, not to whichever peak the link happened to point at.
   useEffect(() => {
     if (didInit.current) return
     didInit.current = true
-    loadFromHash()
-  }, [loadFromHash])
+    void (async () => {
+      const saved = await loadSession()
+      if (saved) {
+        if (saved.overlays.length) setOverlays(saved.overlays)
+        setLayer(saved.layer)
+        setExag(saved.exaggeration)
+        setUnits(saved.units)
+      }
+      const p = new URLSearchParams(location.hash.slice(1))
+      const hashLat = parseFloat(p.get('lat') ?? '')
+      const hashLon = parseFloat(p.get('lon') ?? '')
+      const hasHash = isFinite(hashLat) && isFinite(hashLon)
+      // The saved meta is reusable when the hash points at the same area (or
+      // there is no hash at all) - that is the case that has to work offline.
+      const sameArea =
+        saved?.meta != null &&
+        (!hasHash ||
+          (Math.abs(saved.meta.lat - hashLat) < 1e-5 &&
+            Math.abs(saved.meta.lon - hashLon) < 1e-5 &&
+            saved.meta.radius_km === (parseFloat(p.get('r') ?? '') || 4) &&
+            saved.meta.size === (parseInt(p.get('s') ?? '') || 1024)))
+
+      if (saved?.meta && sameArea) {
+        setRadiusKm(saved.meta.radius_km)
+        setSize(saved.meta.size)
+        await restoreArea(saved.meta, saved.area?.name ?? p.get('name'))
+      } else if (hasHash) {
+        loadFromHash()
+      }
+      restored.current = true
+    })()
+  }, [loadFromHash, restoreArea])
+
+  // Persist the session. Debounced because overlay edits fire on every drag
+  // of a marker-size slider, and photos make each write non-trivial.
+  useEffect(() => {
+    if (!restored.current) return
+    const t = window.setTimeout(() => {
+      void saveSession({
+        area: center
+          ? {
+              lat: center.lat,
+              lon: center.lon,
+              radius_km: meta?.radius_km ?? radiusKm,
+              size: meta?.size ?? size,
+              name: center.name,
+            }
+          : null,
+        meta,
+        layer,
+        exaggeration: exag,
+        overlays,
+        units,
+      })
+    }, 600)
+    return () => window.clearTimeout(t)
+  }, [center, meta, radiusKm, size, layer, exag, overlays, units])
+
+  // Offline status, storage headroom, and the update prompt
+  useEffect(() => {
+    onUpdateReady(() => setUpdateReady(true))
+    const sync = () => setOffline(!navigator.onLine)
+    window.addEventListener('online', sync)
+    window.addEventListener('offline', sync)
+    void storageInfo().then(setStorage)
+    return () => {
+      window.removeEventListener('online', sync)
+      window.removeEventListener('offline', sync)
+    }
+  }, [])
 
   // Editing the hash by hand (or following an in-page link) rebuilds the
   // terrain; our own hash writes in loadAreaAt are ignored via lastHashRef
@@ -277,6 +401,13 @@ export default function App() {
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
   }, [loadFromHash])
+
+  // Ask the backend what this build supports. A packaged binary may ship
+  // without GDAL, so the GeoTIFF control is feature-detected rather than
+  // offered unconditionally and failing server-side.
+  useEffect(() => {
+    api.fetchCapabilities().then(setCaps, () => setCaps(null))
+  }, [])
 
   const onSearch = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -293,7 +424,7 @@ export default function App() {
     setResults([])
     setSearched(false)
     try {
-      setResults(await api.search(query))
+      setResults(await api.search(query, worldwide))
       setSearched(true)
     } catch (err) {
       showError(err)
@@ -630,6 +761,19 @@ export default function App() {
           <h1>MtnMkr</h1>
         </header>
 
+        {offline && (
+          <div className="banner offline-banner">
+            Offline - cached peaks still work. Search and new terrain need a
+            connection.
+          </div>
+        )}
+        {updateReady && (
+          <div className="banner update-banner">
+            <span>A new version is ready.</span>
+            <button onClick={applyUpdate}>Reload</button>
+          </div>
+        )}
+
         <section>
           <div className="sec-head">
             <h2>Locate</h2>
@@ -656,13 +800,40 @@ export default function App() {
                   setQ(e.target.value)
                   setSearched(false)
                 }}
-                placeholder={peakIndex ? 'Filter the list' : 'Peak name or "lat, lon"'}
+                placeholder={
+                  peakIndex
+                    ? 'Filter the list'
+                    : worldwide
+                      ? 'Peak name (worldwide) or "lat, lon"'
+                      : 'Peak name or "lat, lon"'
+                }
                 aria-label="Search for a peak"
               />
               <button type="submit" disabled={searching}>
                 {searching ? '...' : 'Find'}
               </button>
             </form>
+            <label className="worldwide-row">
+              <input
+                type="checkbox"
+                checked={worldwide}
+                onChange={(e) => {
+                  setWorldwide(e.target.checked)
+                  setResults([])
+                  setSearched(false)
+                }}
+              />
+              <span>Search worldwide</span>
+            </label>
+            {worldwide && (
+              <p className="worldwide-note">
+                Worldwide search queries komoot's public Photon service instead of
+                the bundled USGS index. It is a demo endpoint with no uptime
+                guarantee - heavy use is throttled or blocked, and results outside
+                the US only get ~30 m elevation anyway. Leave it off unless you
+                need a peak beyond the United States.
+              </p>
+            )}
             <div className="index-row">
               <span className="index-label">Colorado index</span>
               <button
@@ -768,7 +939,7 @@ export default function App() {
 
         {meta && (
           <section className="sheet">
-            <h2>Sheet</h2>
+            <h2>Peak Data</h2>
             <div className="sheet-name">{center?.name ?? 'Unnamed area'}</div>
             <div className="mono sheet-line">{formatDMS(meta.lat, meta.lon)}</div>
             <div className="mono sheet-line">
@@ -804,9 +975,11 @@ export default function App() {
                 </label>
               ))}
           </div>
-          <button disabled={!meta} onClick={() => tiffInput.current?.click()}>
-            Add GeoTIFF layer
-          </button>
+          {caps?.geotiff !== false && (
+            <button disabled={!meta} onClick={() => tiffInput.current?.click()}>
+              Add GeoTIFF layer
+            </button>
+          )}
           <label className="field">
             <span>
               Vertical exaggeration <em className="mono">{exag.toFixed(1)}x</em>
@@ -928,14 +1101,57 @@ export default function App() {
         </section>
 
         <section>
-          <h2>Project</h2>
+          <h2>Offline</h2>
+          <p className="offline-note">
+            Peaks you open are cached on this device, and your tracks, photos, and
+            notes are saved as you go - so a reload with no signal still works.
+            On iPhone, use Share &rarr; Add to Home Screen: Safari wipes cached
+            data after 7 days without a visit, and home-screen apps are exempt.
+          </p>
+          <div className="offline-stat mono">
+            {storage?.usageBytes != null
+              ? `${fmtBytes(storage.usageBytes)} cached${
+                  storage.quotaBytes ? ` of ${fmtBytes(storage.quotaBytes)} available` : ''
+                }`
+              : 'Storage use unavailable'}
+            {storage?.persisted ? ' · protected from eviction' : ''}
+          </div>
+          <div className="btn-row">
+            {!storage?.persisted && (
+              <button
+                onClick={() =>
+                  void requestPersistence().then(() => storageInfo().then(setStorage))
+                }
+              >
+                Keep offline data
+              </button>
+            )}
+            <button
+              onClick={() => {
+                void (async () => {
+                  await clearCachedTerrain()
+                  await clearSession()
+                  setStorage(await storageInfo())
+                })()
+              }}
+            >
+              Clear cache
+            </button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Project Data</h2>
           <div className="btn-row">
             <button disabled={!meta} onClick={exportProject}>
               Export
             </button>
             <button onClick={() => projectInput.current?.click()}>Import</button>
+          </div>
+          <h3>Offline Map Export</h3>
+          <div className="btn-row">
             <button disabled={!meta} onClick={openExportDialog}>
-              Export page
+              Export HTML/EPUB
             </button>
             <button disabled={!meta} onClick={() => void exportUsdzFile()}>
               Export USDZ
