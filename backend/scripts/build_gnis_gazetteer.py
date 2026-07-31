@@ -13,8 +13,11 @@ Coverage is US-only, which matches where this tool is actually worth using -
 Usage:
     python backend/scripts/build_gnis_gazetteer.py
 
-Writes backend/app/data/gnis_terrain.tsv.gz (regenerate when GNIS updates;
-the file is committed so the app works from a clean checkout).
+Writes frontend/public/gnis_terrain.tsv.gz (regenerate when GNIS updates; the
+file is committed so the app works from a clean checkout). It lives under the
+frontend's static assets because the browser fetches it directly when search
+runs client-side; the backend reads the same file from that path, so there is
+only ever one copy.
 """
 
 import csv
@@ -30,7 +33,15 @@ SOURCE = (
     "DomesticNames/DomesticNames_AllStates_Text.zip"
 )
 
-OUT = Path(__file__).resolve().parent.parent / "app" / "data" / "gnis_terrain.tsv.gz"
+# Written into the frontend's static assets: the browser fetches this
+# directly when search runs client-side, and the backend reads the same file
+# from there. One copy, one source of truth.
+OUT = (
+    Path(__file__).resolve().parent.parent.parent
+    / "frontend"
+    / "public"
+    / "gnis_terrain.tsv.gz"
+)
 
 # GNIS feature classes that are terrain anchors. Mirrors what the Photon path
 # selected with osm_tag=natural + mountain_pass, minus the aquatic types.
@@ -124,7 +135,7 @@ def main() -> int:
             w.writerow([fname, cls, state, county, f"{lat:.5f}", f"{lon:.5f}"])
 
     print(
-        f"Wrote {OUT.relative_to(OUT.parents[3])}: "
+        f"Wrote {OUT}: "
         f"{len(rows):,} features, {OUT.stat().st_size / 1048576:.1f} MB gz",
         file=sys.stderr,
     )

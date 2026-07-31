@@ -17,7 +17,16 @@ import sys
 import threading
 from pathlib import Path
 
-DATA = Path(__file__).resolve().parent / "data" / "gnis_terrain.tsv.gz"
+# Lives under the frontend's static assets, not the backend's, because the
+# browser needs to fetch it directly - search runs client-side in the
+# backend-free deployment. One committed copy serves both; the backend just
+# reads it off disk from where the frontend publishes it.
+DATA = (
+    Path(__file__).resolve().parent.parent.parent
+    / "frontend"
+    / "public"
+    / "gnis_terrain.tsv.gz"
+)
 
 # Search-result priority when scores tie. Mirrors the build script's class
 # ordering; a query that hits a summit and a valley should show the summit.
