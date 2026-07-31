@@ -14,7 +14,7 @@ import math
 
 import httpx
 import numpy as np
-import rasterio
+import tifffile
 from PIL import Image
 
 IMAGE_SERVER = (
@@ -52,9 +52,14 @@ def fetch_3dep(bbox, size: int, client: httpx.Client) -> np.ndarray | None:
     r.raise_for_status()
     if "tiff" not in r.headers.get("content-type", ""):
         return None  # ArcGIS reports errors as JSON with HTTP 200
-    with rasterio.MemoryFile(r.content) as mf:
-        with mf.open() as ds:
-            arr = ds.read(1)
+    # A plain float32 TIFF decode - no CRS work is needed here because the
+    # request already pins bboxSR/imageSR to 3857 and the exact pixel size,
+    # so the server returns the grid we asked for. Using tifffile instead of
+    # rasterio keeps GDAL off the core path, which matters for packaging the
+    # app as a standalone binary (see custom_layers.py).
+    arr = tifffile.imread(io.BytesIO(r.content))
+    if arr.ndim == 3:
+        arr = arr[..., 0] if arr.shape[-1] <= 4 else arr[0]
     return _clean(arr)
 
 

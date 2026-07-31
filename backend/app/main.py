@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from . import custom_layers, dem, geo, imagery
+from . import custom_layers, dem, gazetteer, geo, imagery
 from . import search as search_mod
 from .cache import CACHE_ROOT, area_dir
 
@@ -57,6 +57,21 @@ def _load_meta(area_id: str) -> dict:
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/api/capabilities")
+def capabilities():
+    """What this particular build can do.
+
+    A packaged binary may ship without GDAL (see custom_layers.py) or without
+    the bundled gazetteer, so the frontend feature-detects instead of
+    assuming every control works.
+    """
+    return {
+        "geotiff": custom_layers.AVAILABLE,
+        "gazetteer": gazetteer.available(),
+        "worldwide_search": True,
+    }
 
 
 @app.post("/api/area")
@@ -143,6 +158,8 @@ async def upload_layer(area_id: str, file: UploadFile = File(...)):
         raise HTTPException(413, "GeoTIFF is larger than 300 MB")
     try:
         png = custom_layers.geotiff_to_texture(data, meta["bbox3857"])
+    except RuntimeError as e:
+        raise HTTPException(501, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -165,9 +182,15 @@ def get_custom_layer(area_id: str, layer_id: str):
 
 
 @app.get("/api/search")
-def search(q: str):
+def search(q: str, worldwide: bool = False):
+    """Search terrain features.
+
+    Defaults to the bundled US gazetteer; `worldwide=true` opts in to the
+    Photon proxy, which the UI gates behind an explicit toggle (see
+    search.py for why).
+    """
     try:
-        return search_mod.geocode(q, client)
+        return search_mod.geocode(q, client, worldwide=worldwide)
     except Exception as e:
         raise HTTPException(502, f"Geocoding failed: {e}")
 

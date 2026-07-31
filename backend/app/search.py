@@ -1,23 +1,50 @@
-"""Peak / terrain-feature search, proxied through Photon (komoot's OSM
-geocoder).
+"""Peak / terrain-feature search.
 
-Photon is used instead of Nominatim because it supports server-side class
+Two backends:
+
+**Bundled GNIS (default).** USGS Geographic Names Information System, public
+domain, shipped with the app - see gazetteer.py. US-only, which is the same
+footprint as the 3DEP lidar that makes this tool worth using in the first
+place. No network call, no third-party dependency, no request budget.
+
+**Photon (opt-in).** komoot's OSM geocoder, used for anything outside the US.
+It is off by default because the public instance at photon.komoot.io is a
+demo service, and komoot's terms are explicit: requests must "stay in a
+reasonable limit" and "extensive usage will be throttled or completely
+banned," with no availability guarantee. A distributed copy of this app
+pointing every user at that endpoint is exactly the aggregate load those
+terms are meant to prevent, so the UI asks the user to turn it on and tells
+them why. Users with their own Photon instance can point at it via
+MTNMKR_PHOTON_URL.
+
+Photon is used rather than Nominatim because it supports server-side class
 filtering (osm_tag). Nominatim ranks by general importance, so a query like
-"capitol" returns bus stations and theaters and the actual Capitol Peak
-never cracks the top 30 - post-filtering cannot fix what ranking never
-returns. Photon with osm_tag=natural searches only terrain features.
+"capitol" returns bus stations and theaters and the actual Capitol Peak never
+cracks the top 30 - post-filtering cannot fix what ranking never returns.
 """
+
+import os
 
 import httpx
 
-PHOTON = "https://photon.komoot.io/api/"
+from . import gazetteer
+
+PHOTON = os.environ.get("MTNMKR_PHOTON_URL", "https://photon.komoot.io/api/")
 
 # Aquatic types that come along with the "natural" class but are not
 # terrain anchors for this tool
 EXCLUDE_TYPES = {"water", "bay", "strait", "reef", "shoal", "wetland", "coastline"}
 
+USER_AGENT = "MtnMkr (https://github.com/hiretyler/MtnMkr)"
 
-def geocode(q: str, client: httpx.Client) -> list[dict]:
+
+def geocode(q: str, client: httpx.Client, worldwide: bool = False) -> list[dict]:
+    if not worldwide:
+        return gazetteer.search(q)
+    return _photon(q, client)
+
+
+def _photon(q: str, client: httpx.Client) -> list[dict]:
     r = client.get(
         PHOTON,
         params={
@@ -25,7 +52,7 @@ def geocode(q: str, client: httpx.Client) -> list[dict]:
             "limit": 20,
             "osm_tag": ["natural", "mountain_pass"],
         },
-        headers={"User-Agent": "MtnMkr/0.1 (personal project)"},
+        headers={"User-Agent": USER_AGENT},
     )
     r.raise_for_status()
     out: list[dict] = []

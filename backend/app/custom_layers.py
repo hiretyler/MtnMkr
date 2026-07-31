@@ -3,23 +3,46 @@
 A user can drop in their own georeferenced raster (a scanned USGS quad, a
 drone orthomosaic, a historic topo) and we warp it onto the area's EPSG:3857
 grid so it drapes exactly over the terrain mesh.
+
+This is the only part of the app that needs rasterio, and therefore GDAL:
+arbitrary user rasters arrive in arbitrary projections, so real reprojection
+is unavoidable. Everything else - including the 3DEP GeoTIFF decode in
+dem.py - runs on numpy/Pillow/tifffile alone.
+
+So the import is soft. GDAL roughly triples the size of a packaged binary and
+is the single most fragile thing to bundle (data files, proj.db, hidden
+imports), so a build can legitimately omit it. When it is missing the app
+still does everything else; /api/capabilities reports geotiff: false and the
+frontend hides the upload control rather than offering a button that 500s.
 """
 
 import io
 
 import numpy as np
-import rasterio
 from PIL import Image
-from rasterio.enums import Resampling
-from rasterio.io import MemoryFile
-from rasterio.transform import from_bounds
-from rasterio.warp import reproject
+
+try:
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.io import MemoryFile
+    from rasterio.transform import from_bounds
+    from rasterio.warp import reproject
+
+    AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on how the build was bundled
+    AVAILABLE = False
 
 NODATA_GRAY = 205
 
 
 def geotiff_to_texture(data: bytes, bbox, size: int = 2048) -> bytes:
     """Warp an uploaded GeoTIFF onto the area bbox; returns PNG bytes."""
+    if not AVAILABLE:
+        raise RuntimeError(
+            "This build was packaged without GDAL, so custom GeoTIFF layers "
+            "are unavailable. Run from source (pip install rasterio) to use "
+            "them."
+        )
     with MemoryFile(data) as mf:
         with mf.open() as src:
             if src.crs is None:

@@ -3,5 +3,12 @@ uvicorn[standard]>=0.30
 httpx>=0.27
 numpy>=2.0
 pillow>=10.4
-rasterio>=1.4
+tifffile>=2024.8
 python-multipart>=0.0.9
+
+# Optional: only needed for user-uploaded GeoTIFF layers. Pulls in GDAL,
+# which roughly triples a packaged binary and is the most fragile piece to
+# bundle - so builds may omit it. The app soft-imports it and disables just
+# that feature. See app/custom_layers.py.
+rasterio>=1.4
+

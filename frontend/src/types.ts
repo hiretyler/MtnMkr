@@ -55,6 +55,9 @@ export interface NoteOverlay {
   source?: string
   /** Marker size multiplier (default 1) */
   scale?: number
+  /** Pin fill; defaults to the standard note blue. Used to set the
+   *  "my position" marker apart from trip notes. */
+  color?: string
 }
 
 export type Overlay = TrackOverlay | PhotoOverlay | NoteOverlay
@@ -86,4 +89,15 @@ export interface SearchResult {
   lat: number
   lon: number
   type: string
+}
+
+/** Reported by /api/capabilities. A packaged build may omit GDAL or the
+ *  bundled gazetteer, so controls that depend on them are feature-detected. */
+export interface Capabilities {
+  /** rasterio/GDAL present, so custom GeoTIFF layers can be warped */
+  geotiff: boolean
+  /** the bundled US GNIS index shipped with this build */
+  gazetteer: boolean
+  /** the Photon proxy is reachable for opt-in worldwide search */
+  worldwide_search: boolean
 }
