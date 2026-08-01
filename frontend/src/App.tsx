@@ -21,6 +21,7 @@ import {
 } from './store'
 import { loadArea, reloadArea, PREBAKE_BASE, type TerrainSource } from './direct/source'
 import { findBaked } from './direct/prebake'
+import { textureUrl as usgsTextureUrl } from './direct/usgs'
 import { search as gazetteerSearch } from './direct/gazetteer'
 import { applyUpdate, clearCachedTerrain, onUpdateReady } from './sw-client'
 import { elevDisplay, elevTickStep, fmtDistKm, fmtElev, fmtRes, type Units } from './units'
@@ -130,7 +131,15 @@ export default function App() {
   )
 
   const showError = useCallback((e: unknown) => {
-    setError(e instanceof Error ? e.message : String(e))
+    // Non-Error rejections stringify to noise - a TextureLoader rejects with
+    // the image's error Event, which String() renders as "[object Event]".
+    setError(
+      e instanceof Error
+        ? e.message
+        : typeof e === 'string'
+          ? e
+          : 'A network request failed - check the connection and try again.',
+    )
   }, [])
 
   const updateOverlay = useCallback((id: string, patch: Partial<Overlay>) => {
@@ -195,7 +204,23 @@ export default function App() {
     if (layer === 'shaded') {
       viewer.setShaded()
     } else if (layer === 'topo' || layer === 'imagery') {
-      if (textures) viewer.setTextureUrl(textures[layer]).catch(showError)
+      if (textures) {
+        const url = textures[layer]
+        const label = layer === 'topo' ? 'USGS topo' : 'satellite'
+        viewer.setTextureUrl(url).catch(() => {
+          // A pre-baked texture can vanish when a bake is retired; the meta
+          // always has the bbox, so the same layer can be fetched live.
+          const live = usgsTextureUrl(meta.bbox3857, layer)
+          if (live === url) {
+            showError(new Error(`The ${label} layer failed to load.`))
+            return
+          }
+          viewer
+            .setTextureUrl(live)
+            .then(() => setTextures((prev) => (prev ? { ...prev, [layer]: live } : prev)))
+            .catch(() => showError(new Error(`The ${label} layer failed to load.`)))
+        })
+      }
     } else {
       const id = layer.slice('custom:'.length)
       const cl = customLayers.find((c) => c.id === id)
