@@ -26,7 +26,7 @@ cuts the gzipped payload roughly in half (12.9 MB -> 7.5 MB at 2048).
 Usage:
     python backend/scripts/prebake_peaks.py --out prebake
     python backend/scripts/prebake_peaks.py --out prebake --size 1024 --limit 5
-    python backend/scripts/prebake_peaks.py --out prebake --include-unranked
+    python backend/scripts/prebake_peaks.py --out prebake --min-ft 13000
 
 Resumable: anything already written is skipped, so a run interrupted halfway
 picks up where it left off. Baking all 58 ranked 14ers at 2048 moves roughly
@@ -145,20 +145,12 @@ def enclosing_area(group: list[dict], radius_km: float) -> tuple[float, float, f
     return round(clat, 5), round(clon, 5), radius_km
 
 
-def load_peaks(min_ft: float, max_ft: float, include_unranked: bool) -> list[dict]:
+def load_peaks(min_ft: float, max_ft: float) -> list[dict]:
+    # The index is GNIS-derived (see gnis_to_peaks_json.py), so every entry
+    # is an officially named summit; officially named subpeaks cluster into
+    # shared tiles via group_peaks rather than being filtered here.
     peaks = json.loads(PEAKS_JSON.read_text())
-    out = []
-    for p in peaks:
-        ft = p["e"] / FT
-        if not (min_ft <= ft < max_ft):
-            continue
-        # 14ers.com wraps unofficial / unranked summits in quotes. Those are
-        # mostly subpeaks a few hundred metres from a ranked peak, so baking
-        # them duplicates terrain that is already covered.
-        if not include_unranked and p["n"].startswith('"'):
-            continue
-        out.append(p)
-    return out
+    return [p for p in peaks if min_ft <= p["e"] / FT < max_ft]
 
 
 def quantize(heights: np.ndarray) -> tuple[bytes, float, float]:
@@ -252,7 +244,6 @@ def main() -> int:
     ap.add_argument("--radius", type=float, default=4.0, help="area radius in km")
     ap.add_argument("--min-ft", type=float, default=14000.0)
     ap.add_argument("--max-ft", type=float, default=99000.0)
-    ap.add_argument("--include-unranked", action="store_true")
     ap.add_argument(
         "--margin-km",
         type=float,
@@ -265,7 +256,7 @@ def main() -> int:
     ap.add_argument("--delay", type=float, default=1.0, help="seconds between peaks")
     args = ap.parse_args()
 
-    peaks = load_peaks(args.min_ft, args.max_ft, args.include_unranked)
+    peaks = load_peaks(args.min_ft, args.max_ft)
 
     # Build the area plan: each entry is (lat, lon, radius_km, [peaks]).
     # A group may spread at most radius - margin, so every peak keeps at least

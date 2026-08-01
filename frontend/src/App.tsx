@@ -917,7 +917,7 @@ export default function App() {
                       {shownPeaks.length === classPeaks.length
                         ? `${classPeaks.length} peaks`
                         : `${shownPeaks.length} of ${classPeaks.length} peaks`}
-                      {peakIndex === '14' ? ' ≥ 14,000 ft' : ' 13,000-13,999 ft'} · 14ers.com
+                      {peakIndex === '14' ? ' ≥ 14,000 ft' : ' 13,000-13,999 ft'} · USGS GNIS
                     </li>
                     {shownPeaks.map((p) => (
                       <li key={`${p.n}:${p.lat}`}>
@@ -1222,7 +1222,7 @@ export default function App() {
         </section>
 
         <footer className="credits mono">
-          Elevation USGS 3DEP · Topo and NAIP USGS · Search Photon/OSM · Peak index 14ers.com
+          Elevation USGS 3DEP · Topo and NAIP USGS · Search Photon/OSM · Peak index USGS GNIS
         </footer>
       </aside>
 

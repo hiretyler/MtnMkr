@@ -1,8 +1,10 @@
 import raw from './data/colorado-peaks.json'
 
-/** Compact bundled peak index (source: 14ers.com waypoint export). */
+/** Compact bundled peak index: USGS GNIS summit names/coordinates with
+ *  elevations sampled from 3DEP (all public domain). Regenerate with
+ *  backend/scripts/gnis_to_peaks_json.py. */
 export interface Peak {
-  /** Name; 14ers.com wraps unofficial/unranked names in quotes */
+  /** Official GNIS name */
   n: string
   lat: number
   lon: number

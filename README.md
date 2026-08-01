@@ -32,8 +32,8 @@ for its shared disk cache, and required only for user-uploaded GeoTIFFs. See
   use (see `backend/app/search.py`). Point `MTNMKR_PHOTON_URL` at your own
   Photon instance to use it freely.
 - **Colorado index**: one-click, filterable lists of all Colorado 14ers and
-  13ers (14ers.com waypoint data, bundled as JSON - regenerate with
-  `backend/scripts/gpx_to_peaks_json.py`).
+  13ers (USGS GNIS summit names with elevations sampled from 3DEP, bundled
+  as JSON - regenerate with `backend/scripts/gnis_to_peaks_json.py`).
 - **Draped layers**: shaded relief, USGS topo, NAIP satellite, or any GeoTIFF
   you upload (scanned quads, drone orthos) - warped onto the terrain
   server-side. GeoTIFF upload is the one feature that needs a backend; the
@@ -324,5 +324,5 @@ another endpoint.
 - Optional worldwide search: Photon by komoot, OSM data (ODbL; komoot's
   public instance is a demo service - "requests must stay in a reasonable
   limit," extensive use is throttled or banned, no uptime guarantee)
-- Colorado peak index: 14ers.com waypoint export (use with caution, per
-  their disclaimer)
+- Colorado peak index: USGS GNIS summit names/coordinates with elevations
+  sampled from 3DEP (public domain)
