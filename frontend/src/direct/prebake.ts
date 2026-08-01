@@ -18,21 +18,29 @@
 import type { AreaMeta } from '../types'
 import { areaId } from './usgs'
 
-export interface PrebakeEntry {
+export interface PrebakePeak {
   name: string
   lat: number
   lon: number
   elev_m: number
+}
+
+/** One published tile. Nearby summits share a tile, so an area's centre is
+ *  not necessarily any of its peaks. */
+export interface PrebakeArea {
+  name: string
+  lat: number
+  lon: number
   id: string
   radius_km: number
   size: number
+  peaks: PrebakePeak[]
 }
 
 export interface PrebakeIndex {
   version: number
-  radius_km: number
   size: number
-  peaks: PrebakeEntry[]
+  areas: PrebakeArea[]
 }
 
 interface HeightsEncoding {
@@ -55,6 +63,29 @@ export function loadIndex(baseUrl: string): Promise<PrebakeIndex | null> {
       .catch(() => null)
   }
   return indexCache
+}
+
+/**
+ * The baked area covering this summit, or null. Matched against each area's
+ * member peaks rather than its centre, so a grouped tile answers for every
+ * summit on it.
+ */
+export async function findBaked(
+  baseUrl: string,
+  lat: number,
+  lon: number,
+): Promise<PrebakeArea | null> {
+  const idx = await loadIndex(baseUrl)
+  if (!idx) return null
+  // ~11 m: the peak list and the bake read the same gazetteer, so anything
+  // beyond float formatting noise is a genuine miss.
+  const EPS = 1e-4
+  for (const area of idx.areas) {
+    for (const p of area.peaks) {
+      if (Math.abs(p.lat - lat) < EPS && Math.abs(p.lon - lon) < EPS) return area
+    }
+  }
+  return null
 }
 
 async function decodeHeights(buf: ArrayBuffer, enc: HeightsEncoding): Promise<Float32Array> {

@@ -19,7 +19,8 @@ import {
   storageInfo,
   type StorageInfo,
 } from './store'
-import { loadArea, reloadArea, type TerrainSource } from './direct/source'
+import { loadArea, reloadArea, PREBAKE_BASE, type TerrainSource } from './direct/source'
+import { findBaked } from './direct/prebake'
 import { search as gazetteerSearch } from './direct/gazetteer'
 import { applyUpdate, clearCachedTerrain, onUpdateReady } from './sw-client'
 import { elevDisplay, elevTickStep, fmtDistKm, fmtElev, fmtRes, type Units } from './units'
@@ -262,12 +263,35 @@ export default function App() {
 
   const loadAreaAt = useCallback(
     async (lat: number, lon: number, name: string | null, r?: number, s?: number) => {
-      const radius = r ?? radiusKm
-      const px = s ?? size
+      let radius = r ?? radiusKm
+      let px = s ?? size
+      // Terrain centre. For a pre-baked summit this becomes the published
+      // tile's centre, which for a grouped tile is not the summit itself;
+      // `center` stays on the summit the user asked for, so the benchmark
+      // hill-climb still starts from the right peak.
+      let at = { lat, lon }
       setCenter({ lat, lon, name })
       setBusy('Locating terrain...')
       try {
-        const got = await loadArea(lat, lon, radius, px, name, await capsRef.current, setBusy)
+        // A summit covered by the pre-bake opens as its published tile - the
+        // predictable-latency path the bake exists for. An explicit radius or
+        // grid that differs from the baked one is a deliberate custom build
+        // and takes the live path.
+        if (PREBAKE_BASE) {
+          const baked = await findBaked(PREBAKE_BASE, lat, lon)
+          if (
+            baked &&
+            ((r === undefined && s === undefined) ||
+              (r === baked.radius_km && s === baked.size))
+          ) {
+            radius = baked.radius_km
+            px = baked.size
+            at = { lat: baked.lat, lon: baked.lon }
+          }
+        }
+        setRadiusKm(radius)
+        setSize(px)
+        const got = await loadArea(at.lat, at.lon, radius, px, name, await capsRef.current, setBusy)
         const m = got.meta
         viewerRef.current?.setTerrain(m, got.heights)
         setMeta(m)
@@ -295,8 +319,12 @@ export default function App() {
    * cache, so this is the path that works with no signal.
    */
   const restoreArea = useCallback(
-    async (m: AreaMeta, name: string | null) => {
-      setCenter({ lat: m.lat, lon: m.lon, name })
+    async (m: AreaMeta, name: string | null, at?: { lat: number; lon: number } | null) => {
+      // `at` is the summit the session was looking at; on a grouped pre-baked
+      // tile that is not the tile's centre, and the benchmark hill-climb has
+      // to start from the summit.
+      const c = at ?? { lat: m.lat, lon: m.lon }
+      setCenter({ lat: c.lat, lon: c.lon, name })
       setBusy('Loading cached terrain...')
       try {
         const got = await reloadArea(m, await capsRef.current)
@@ -304,7 +332,7 @@ export default function App() {
         setMeta(got.meta)
         setTextures(got.textures)
         setTerrainSource(got.source)
-        const hash = `lat=${m.lat.toFixed(5)}&lon=${m.lon.toFixed(5)}&r=${m.radius_km}&s=${
+        const hash = `lat=${c.lat.toFixed(5)}&lon=${c.lon.toFixed(5)}&r=${m.radius_km}&s=${
           m.size
         }${name ? `&name=${encodeURIComponent(name)}` : ''}`
         lastHashRef.current = hash
@@ -355,18 +383,23 @@ export default function App() {
       const hasHash = isFinite(hashLat) && isFinite(hashLon)
       // The saved meta is reusable when the hash points at the same area (or
       // there is no hash at all) - that is the case that has to work offline.
+      // The hash (like the saved area) names the summit the user was looking
+      // at, which on a grouped pre-baked tile is not the tile's centre - so
+      // compare against the saved summit, falling back to the tile centre.
+      const savedLat = saved?.area?.lat ?? saved?.meta?.lat ?? NaN
+      const savedLon = saved?.area?.lon ?? saved?.meta?.lon ?? NaN
       const sameArea =
         saved?.meta != null &&
         (!hasHash ||
-          (Math.abs(saved.meta.lat - hashLat) < 1e-5 &&
-            Math.abs(saved.meta.lon - hashLon) < 1e-5 &&
+          (Math.abs(savedLat - hashLat) < 1e-5 &&
+            Math.abs(savedLon - hashLon) < 1e-5 &&
             saved.meta.radius_km === (parseFloat(p.get('r') ?? '') || 4) &&
             saved.meta.size === (parseInt(p.get('s') ?? '') || 1024)))
 
       if (saved?.meta && sameArea) {
         setRadiusKm(saved.meta.radius_km)
         setSize(saved.meta.size)
-        await restoreArea(saved.meta, saved.area?.name ?? p.get('name'))
+        await restoreArea(saved.meta, saved.area?.name ?? p.get('name'), saved.area)
       } else if (hasHash) {
         loadFromHash()
       }
@@ -957,7 +990,7 @@ export default function App() {
           {center && (
             <button
               className="primary"
-              onClick={() => void loadAreaAt(center.lat, center.lon, center.name)}
+              onClick={() => void loadAreaAt(center.lat, center.lon, center.name, radiusKm, size)}
             >
               Rebuild terrain
             </button>

@@ -391,6 +391,12 @@ input[type='color'] {
   cursor: pointer;
 }
 
+/* display:flex above beats the UA's [hidden] rule, so restate it: a build
+   with no backend hides this row via the hidden attribute. */
+.worldwide-row[hidden] {
+  display: none;
+}
+
 .worldwide-row input {
   accent-color: var(--contour);
   width: auto;

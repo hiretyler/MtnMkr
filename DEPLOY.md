@@ -3,9 +3,16 @@
 Target: the app served from **https://tgeddes.dev/mtnmkr/** (static, no
 backend), with pre-baked terrain on **Cloudflare R2**.
 
-Nothing here has been done yet - as of the last commit the app has never been
-deployed, and `tgeddes.dev/mtnmkr/` returns 404. Background on why this shape
-was chosen is in the README ("Where terrain comes from", "Deploying").
+First executed 2026-07-31; the site is live. Current production values:
+
+- R2 bucket: `mtnmkr-tiles` (location hint `wnam`), public dev URL
+  `https://pub-f6a251cb37ab4ae5939e965c6c6b45a2.r2.dev`
+- CORS on the bucket: `GET`/`HEAD` from `https://tgeddes.dev`, max-age 86400
+- Upload was done with `wrangler r2 object put` per file (wrangler OAuth;
+  rclone works too but needs an R2 API token created in the dashboard)
+
+Background on why this shape was chosen is in the README ("Where terrain
+comes from", "Deploying").
 
 The three steps are independent and resumable in this order.
 
@@ -47,7 +54,7 @@ du -sh prebake
 Bucket holds ~544 MB, inside R2's 10 GB free tier, and egress is free.
 
 ```sh
-rclone sync prebake/ r2:<bucket>/ --progress
+rclone sync prebake/ r2:mtnmkr-tiles/ --progress
 ```
 
 Two settings that matter:
@@ -62,14 +69,21 @@ Two settings that matter:
 Verify one object end to end before moving on:
 
 ```sh
-curl -sI https://<r2-domain>/index.json | grep -i "access-control\|content-type"
+curl -sI -H "Origin: https://tgeddes.dev" \
+  https://pub-f6a251cb37ab4ae5939e965c6c6b45a2.r2.dev/index.json \
+  | grep -i "access-control\|content-type"
 ```
+
+(The `Origin` header matters: R2 only emits the CORS headers on requests
+that carry one, so a bare `curl -sI` looks broken when it is not.)
 
 ## 3. Build and deploy the frontend
 
 ```sh
 cd frontend
-MTNMKR_BASE=/mtnmkr/ VITE_PREBAKE_BASE=https://<r2-domain> npm run build
+MTNMKR_BASE=/mtnmkr/ \
+VITE_PREBAKE_BASE=https://pub-f6a251cb37ab4ae5939e965c6c6b45a2.r2.dev \
+npm run build
 ```
 
 **Leave `VITE_API_BASE` unset.** With no backend the app goes direct to USGS,
@@ -89,20 +103,23 @@ rsync -avz --delete -e "ssh -i ~/.ssh/tgeddes_dev -p 21098" \
 
 ### Two things on the tgeddes.dev side
 
-1. **`deploy.sh` in the tgeddes.dev repo uses `--delete` and will wipe
-   `mtnmkr/` on its next run.** It needs an `--exclude 'mtnmkr/'` line
-   alongside the existing `playground/` and `kidplan/` entries. Not yet done -
-   that repo has not been touched.
+1. **`deploy.sh` in the tgeddes.dev repo uses `--delete` and would wipe
+   `mtnmkr/` on its next run.** Fixed 2026-07-31: it now has an
+   `--exclude 'mtnmkr/'` line alongside the existing `playground/` and
+   `kidplan/` entries.
 
-2. **`sw.js` must be served with `Cache-Control: no-cache`.** The current
-   `.htaccess` sets that for `.html` only. Miss this and visitors get pinned to
-   whichever build they first loaded and never see an update. Add:
+2. **`sw.js` must be served with `Cache-Control: no-cache`.** Also done
+   2026-07-31: the tgeddes.dev repo's `.htaccess` (which is what lands on the
+   server) now carries, alongside its `.html` rule:
 
    ```apache
    <FilesMatch "sw\.js$">
      Header set Cache-Control "no-cache, must-revalidate"
    </FilesMatch>
    ```
+
+   Miss this and visitors get pinned to whichever build they first loaded and
+   never see an update.
 
 ## Verifying the deploy
 
