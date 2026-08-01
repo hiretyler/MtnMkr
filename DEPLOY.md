@@ -66,6 +66,13 @@ Two settings that matter:
   sniffs the gzip magic number and handles either case, but leaving the header
   off avoids the double-decompress ambiguity entirely.
 
+Re-baking later: changed coordinates or settings change every area id.
+Upload the new area dirs plus the new `index.json` (same URL - the service
+worker deliberately fetches the manifest network-first, because a
+cache-first manifest would pin clients to retired area ids), then delete
+the retired dirs. Clients holding a stale manifest fall back to the live
+path until their next fetch; nothing breaks.
+
 Verify one object end to end before moving on:
 
 ```sh

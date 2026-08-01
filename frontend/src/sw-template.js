@@ -96,7 +96,8 @@ function isTerrainData(url) {
   // A 3DEP or basemap export is fully determined by its query string, so the
   // request URL is a sound cache key even though it is not a tidy path.
   if (USGS_ORIGINS.includes(url.origin)) return true
-  // Pre-baked tiles are content-addressed and immutable.
+  // Pre-baked tiles are content-addressed and immutable. (The manifest,
+  // index.json, is not - the fetch handler intercepts it before this check.)
   if (PREBAKE_ORIGIN && url.origin === PREBAKE_ORIGIN) return true
   // Only fetched when the user exports; runtime-cached so exports keep
   // working offline once they have been used at least once.
@@ -110,6 +111,23 @@ async function cacheFirst(request, cacheName) {
   const res = await fetch(request)
   if (res.ok) cache.put(request, res.clone()).catch(() => undefined)
   return res
+}
+
+/** Network first, cached copy as the offline fallback. For the one mutable
+ *  file on the tile origin: the pre-bake manifest, republished on every
+ *  re-bake under the same URL. Serving it cache-first would pin the app to
+ *  a retired bake's area ids forever. */
+async function networkFirst(request, cacheName) {
+  const cache = await caches.open(cacheName)
+  try {
+    const res = await fetch(request)
+    if (res.ok) cache.put(request, res.clone()).catch(() => undefined)
+    return res
+  } catch (err) {
+    const hit = await cache.match(request)
+    if (hit) return hit
+    throw err
+  }
 }
 
 self.addEventListener('fetch', (event) => {
@@ -143,6 +161,11 @@ self.addEventListener('fetch', (event) => {
         )
       }),
     )
+    return
+  }
+
+  if (PREBAKE_ORIGIN && url.origin === PREBAKE_ORIGIN && url.pathname.endsWith('/index.json')) {
+    event.respondWith(networkFirst(request, DATA_CACHE))
     return
   }
 
