@@ -23,8 +23,13 @@ The three steps are independent and resumable in this order.
 ```sh
 cd /Users/tylergeddes/projects/MtnMkr
 backend/.venv/bin/python backend/scripts/prebake_peaks.py --plan
-backend/.venv/bin/python backend/scripts/prebake_peaks.py --out prebake
+backend/.venv/bin/python backend/scripts/prebake_peaks.py --out prebake --tex-size 4096
 ```
+
+Textures bake at 4096 (~2 m/px; the basemap services' max export) since
+2026-08-07 - the DEM grid stays 2048, so area ids are unaffected by the
+texture size. Expect ~1 GB total rather than the ~544 MB a 2048-texture
+bake produces.
 
 Defaults: 2048 grid, 4 km radius, `--margin-km 3.0`. Expect **45 areas (10
 grouped), ~544 MB, roughly 25 minutes** - almost all of it waiting on USGS,

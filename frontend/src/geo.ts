@@ -172,6 +172,15 @@ export class Heightfield {
       tMin = Math.max(tMin, (maxY - o.y) / dir.y)
     }
 
+    // A near-vertical ray defeats the horizontal slab test - tMax comes out
+    // astronomical, or Infinity when both horizontal components are ~0 - and
+    // an upward one never intersects, so the march must be capped to the
+    // longest path that can actually cross the box or it spins forever.
+    tMax = Math.min(
+      tMax,
+      tMin + 8 * half + (this.meta.max_elev - this.meta.min_elev) * Math.max(exag, 1),
+    )
+
     const step = Math.max(this.meta.resolution_m, (2 * half) / 2000)
     const p = new THREE.Vector3()
     let tPrev = tMin
@@ -245,6 +254,52 @@ export function buildTerrainGeometry(hf: Heightfield, exag: number): THREE.Buffe
   geom.setIndex(new THREE.BufferAttribute(index, 1))
   geom.computeVertexNormals()
   return geom
+}
+
+/**
+ * Lambertian hillshade of the heightfield as a single-channel texture, lit
+ * from azimuth 315 deg at 45 deg altitude - the same northwest-sun
+ * convention as the scene lighting. Computed from true (unexaggerated)
+ * elevations: like the hillshade printed on a map it encodes the real
+ * terrain, so it deliberately does not track the exaggeration slider - the
+ * scene lighting already conveys exaggerated relief, and recomputing a
+ * full-grid pass on every slider tick would buy nothing.
+ * Rows are flipped so texture v matches the terrain UVs (v = 1 at north).
+ */
+export function buildHillshadeTexture(hf: Heightfield): THREE.DataTexture {
+  const { width: W, height: H } = hf.meta
+  const d = hf.data
+  const dx = hf.meta.ground_size_m / (W - 1)
+  const dy = hf.meta.ground_size_m / (H - 1)
+  // Sun direction in (east, north, up)
+  const lx = -0.5
+  const ly = 0.5
+  const lz = Math.SQRT1_2
+  const out = new Uint8Array(W * H)
+  for (let r = 0; r < H; r++) {
+    const rN = Math.max(r - 1, 0)
+    const rS = Math.min(r + 1, H - 1)
+    const row = r * W
+    const outRow = (H - 1 - r) * W
+    for (let c = 0; c < W; c++) {
+      const cW = Math.max(c - 1, 0)
+      const cE = Math.min(c + 1, W - 1)
+      const dzde = (d[row + cE] - d[row + cW]) / ((cE - cW) * dx)
+      // Row index grows southward, so the northern neighbor is the lower row
+      const dzdn = (d[rN * W + c] - d[rS * W + c]) / ((rS - rN) * dy)
+      // Surface normal is (-dzde, -dzdn, 1) before normalization
+      const nl = (-dzde * lx - dzdn * ly + lz) / Math.sqrt(dzde * dzde + dzdn * dzdn + 1)
+      out[outRow + c] = nl > 0 ? Math.round(nl * 255) : 0
+    }
+  }
+  const tex = new THREE.DataTexture(out, W, H, THREE.RedFormat, THREE.UnsignedByteType)
+  tex.minFilter = THREE.LinearMipmapLinearFilter
+  tex.magFilter = THREE.LinearFilter
+  tex.generateMipmaps = true
+  // Single-byte rows are not 4-byte aligned at every width
+  tex.unpackAlignment = 1
+  tex.needsUpdate = true
+  return tex
 }
 
 /**

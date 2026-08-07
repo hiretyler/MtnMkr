@@ -3,7 +3,13 @@ import { MapControls } from 'three/addons/controls/MapControls.js'
 import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
-import { buildTerrainGeometry, Heightfield, projectTrackSegment } from './geo'
+import { textureUrl, type Bbox } from './direct/usgs'
+import {
+  buildHillshadeTexture,
+  buildTerrainGeometry,
+  Heightfield,
+  projectTrackSegment,
+} from './geo'
 import {
   makeNotePinTexture,
   makePhotoPinTexture,
@@ -39,6 +45,72 @@ export interface ViewerEvents {
 const SHADED_COLOR = 0xb5b0a4
 const FOG_COLOR = 0xc9cfc4
 
+// ---- zoom detail + relief shading constants ----------------------------
+
+// Fetch a sharper sub-area export once the ground the camera is looking at
+// is closer than this. Judged by the look-at point's distance, not the
+// frame's ground footprint - an oblique mountain view sweeps kilometres of
+// background that the patch was never meant to cover, and a footprint test
+// would keep the feature from ever engaging.
+const DETAIL_MAX_SPAN_M = 3000
+// Never fetch below this ground span: 2048 px over 600 m is ~0.3 m/px,
+// already past what NAIP resolves.
+const DETAIL_MIN_SPAN_M = 600
+// Only hits this close to the look-at point size the patch; farther ones
+// are background and keep the base texture.
+const DETAIL_NEAR_M = 1500
+// Patch never wider than this: past it a 2048 px export stops clearly
+// out-resolving a 4096 base, and the sharpness gate would veto anyway.
+const DETAIL_PATCH_CAP_M = 2500
+const DETAIL_SIZE = 2048
+// Idle time before the camera counts as at rest
+const DETAIL_REST_MS = 500
+
+// Where the view is sampled to find the on-screen ground extent. Center
+// first - a center miss means mostly sky, and a patch would be guesswork.
+const DETAIL_NDC: readonly (readonly [number, number])[] = [
+  [0, 0],
+  [-0.85, 0],
+  [0.85, 0],
+  [0, -0.85],
+  [0, 0.85],
+  [-0.85, -0.85],
+  [0.85, -0.85],
+  [-0.85, 0.85],
+  [0.85, 0.85],
+]
+
+// Replaces three's map_fragment chunk. Everything sits inside USE_MAP, so
+// the untextured 'shaded' layer compiles to the stock shader and renders
+// exactly as before. The detail patch blends over the base drape inside its
+// UV window with a smoothstep edge; the hillshade then multiplies both.
+// Texture samples stay in dynamically-uniform control flow so the implicit
+// mipmap derivatives remain defined.
+const DRAPE_MAP_FRAGMENT = /* glsl */ `
+#ifdef USE_MAP
+  vec4 sampledDiffuseColor = texture2D( map, vMapUv );
+  if ( uDetailFade > 0.0 ) {
+    vec2 dUv = ( vMapUv - uDetailWindow.xy ) / uDetailWindow.zw;
+    vec2 edge = smoothstep( vec2( 0.0 ), vec2( 0.06 ), dUv )
+      * smoothstep( vec2( 0.0 ), vec2( 0.06 ), vec2( 1.0 ) - dUv );
+    vec3 detail = texture2D( uDetailMap, clamp( dUv, 0.0, 1.0 ) ).rgb;
+    sampledDiffuseColor.rgb = mix( sampledDiffuseColor.rgb, detail, edge.x * edge.y * uDetailFade );
+  }
+  if ( uRelief > 0.0 ) {
+    sampledDiffuseColor.rgb *= mix( 1.0, texture2D( uHillshadeMap, vMapUv ).r, uRelief );
+  }
+  diffuseColor *= sampledDiffuseColor;
+#endif
+`
+
+const DRAPE_UNIFORM_DECLS = /* glsl */ `
+uniform sampler2D uDetailMap;
+uniform vec4 uDetailWindow;
+uniform float uDetailFade;
+uniform sampler2D uHillshadeMap;
+uniform float uRelief;
+`
+
 export class Viewer {
   private renderer: THREE.WebGLRenderer
   private scene = new THREE.Scene()
@@ -56,6 +128,36 @@ export class Viewer {
   private raycaster = new THREE.Raycaster()
   private resizeObserver: ResizeObserver
   private textureToken = 0
+
+  // Detail patch + relief shading. drapeUniforms is shared with every
+  // compiled variant of the terrain shader by reference, so writing .value
+  // here reaches the GPU without touching the material.
+  private drapeUniforms = {
+    uDetailMap: { value: null as THREE.Texture | null },
+    uDetailWindow: { value: new THREE.Vector4(0, 0, 1, 1) },
+    uDetailFade: { value: 0 },
+    uHillshadeMap: { value: null as THREE.Texture | null },
+    uRelief: { value: 0 },
+  }
+  private drapeKind: 'topo' | 'imagery' | null = null
+  // True while the bound map is not yet the current kind's base drape (layer
+  // or area just changed) - a detail patch fetched then would blend the new
+  // layer's pixels over the old layer's texture
+  private basePending = false
+  private reliefStrength = 0
+  private hillshadeTexture: THREE.DataTexture | null = null
+  private hillshadeTimer: ReturnType<typeof setTimeout> | null = null
+  private detailToken = 0
+  private detailAbort: AbortController | null = null
+  private detailTexture: THREE.Texture | null = null
+  private detailBbox: Bbox | null = null
+  private detailFade: { start: number } | null = null
+  // Camera-rest tracking for the detail fetch
+  private lastCamPos = new THREE.Vector3()
+  private lastCamTarget = new THREE.Vector3()
+  private lastMoveAt = 0
+  private restHandled = true
+  private ndcTmp = new THREE.Vector2()
 
   private hfInternal: Heightfield | null = null
   private exag = 1
@@ -103,6 +205,15 @@ export class Viewer {
       roughness: 1,
       metalness: 0,
     })
+    // Same material for every layer; the injected chunk only runs when a
+    // map is bound. three keys its program cache on this function's source
+    // plus USE_MAP, so the shaded and draped variants coexist.
+    this.material.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, this.drapeUniforms)
+      shader.fragmentShader =
+        DRAPE_UNIFORM_DECLS +
+        shader.fragmentShader.replace('#include <map_fragment>', DRAPE_MAP_FRAGMENT)
+    }
 
     this.controls = new MapControls(this.camera, canvas)
     this.controls.enableDamping = true
@@ -147,6 +258,17 @@ export class Viewer {
       this.terrain.geometry.dispose()
     }
     this.hfInternal = new Heightfield(meta, heights)
+
+    // The old hillshade and detail patch describe the old terrain, the
+    // bound base texture is stale until the layer effect reloads it, and
+    // any in-flight base load still belongs to the old area
+    this.clearDetail()
+    this.basePending = true
+    this.textureToken++
+    this.hillshadeTexture?.dispose()
+    this.hillshadeTexture = null
+    this.drapeUniforms.uHillshadeMap.value = null
+    this.applyRelief()
 
     const geom = buildTerrainGeometry(this.hfInternal, this.exag)
     this.terrain = new THREE.Mesh(geom, this.material)
@@ -196,6 +318,10 @@ export class Viewer {
     }
     posAttr.needsUpdate = true
     this.terrain.geometry.computeVertexNormals()
+    // The reshaped terrain changes what the camera sees - re-evaluate the
+    // detail patch without waiting for a camera nudge
+    this.restHandled = false
+    this.lastMoveAt = performance.now()
     this.renderOverlays()
   }
 
@@ -203,6 +329,7 @@ export class Viewer {
 
   setShaded(): void {
     this.textureToken++
+    this.clearDetail()
     if (this.material.map) {
       this.material.map.dispose()
       this.material.map = null
@@ -213,7 +340,31 @@ export class Viewer {
 
   async setTextureUrl(url: string): Promise<void> {
     const token = ++this.textureToken
-    const tex = await new THREE.TextureLoader().loadAsync(url)
+    let tex: THREE.Texture
+    try {
+      tex = await new THREE.TextureLoader().loadAsync(url)
+    } catch (err) {
+      // Only the current load's failure may reach the caller - a superseded
+      // load rejecting late would fire the caller's fallback with a stale
+      // closure over the wrong area or layer
+      if (token !== this.textureToken) return
+      throw err
+    }
+    if (token !== this.textureToken) {
+      tex.dispose()
+      return
+    }
+    // Decode now so the first render tick that samples the texture does not
+    // pay a synchronous decode. Bounded: Chrome can leave decode() pending
+    // indefinitely (observed on 4096px JPEGs), and an unresolved await here
+    // would strand the drape unbound - the upload-time decode stall is the
+    // lesser evil.
+    try {
+      const d = (tex.image as { decode?: () => Promise<void> }).decode?.()
+      if (d) await Promise.race([d, new Promise((r) => setTimeout(r, 1500))])
+    } catch {
+      // Decode errors are fine - the GPU upload decodes it instead
+    }
     if (token !== this.textureToken) {
       tex.dispose()
       return
@@ -224,6 +375,242 @@ export class Viewer {
     this.material.map = tex
     this.material.color.set(0xffffff)
     this.material.needsUpdate = true
+    // A fresh base drape unblocks detail fetching and restarts the idle
+    // clock, so a camera already at rest still gets its patch evaluated
+    this.basePending = false
+    this.restHandled = false
+    this.lastMoveAt = performance.now()
+  }
+
+  // ---- zoom detail + relief shading -------------------------------------
+
+  /**
+   * Which base drape is showing. Gates both the zoom-detail fetch and the
+   * relief hillshade: the shaded layer and custom layers pass null and get
+   * neither.
+   */
+  setDrapeKind(kind: 'topo' | 'imagery' | null): void {
+    if (kind === this.drapeKind) return
+    this.drapeKind = kind
+    // A patch fetched for the old layer is the wrong content for the new
+    // one, and the new base texture has not landed yet
+    this.clearDetail()
+    this.basePending = true
+    this.applyRelief()
+  }
+
+  /** Relief hillshade strength over the drape, 0..1. */
+  setReliefStrength(strength: number): void {
+    this.reliefStrength = strength
+    this.applyRelief()
+  }
+
+  private applyRelief(): void {
+    const hf = this.hfInternal
+    const on = this.drapeKind !== null && this.reliefStrength > 0 && hf !== null
+    // Live only once the texture exists - the shader would otherwise sample
+    // three's black fallback and darken the whole drape
+    this.drapeUniforms.uRelief.value = on && this.hillshadeTexture ? this.reliefStrength : 0
+    // Built lazily (sessions that never show relief never pay the pass) and
+    // off the current tick - the full-grid pass is millions of texels and
+    // would hitch a mid-drag slider frame. One pending build at a time.
+    if (on && hf && !this.hillshadeTexture && this.hillshadeTimer === null) {
+      this.hillshadeTimer = setTimeout(() => {
+        this.hillshadeTimer = null
+        if (this.hfInternal === hf && !this.hillshadeTexture) {
+          this.hillshadeTexture = buildHillshadeTexture(hf)
+          this.drapeUniforms.uHillshadeMap.value = this.hillshadeTexture
+        }
+        // Raises uRelief now the texture exists - or reschedules when the
+        // terrain changed while the build waited
+        this.applyRelief()
+      }, 0)
+    }
+  }
+
+  private clearDetail(): void {
+    this.detailToken++
+    this.detailAbort?.abort()
+    this.detailAbort = null
+    this.detailFade = null
+    this.drapeUniforms.uDetailFade.value = 0
+    this.drapeUniforms.uDetailMap.value = null
+    this.detailTexture?.dispose()
+    this.detailTexture = null
+    this.detailBbox = null
+  }
+
+  /**
+   * Rest detection for the detail fetch. MapControls' 'end' event fires on
+   * pointer release, before the damped glide settles, so rest has to mean
+   * frame-to-frame stillness of both camera and target. Any motion cancels
+   * an in-flight fetch; sustained stillness triggers one evaluation.
+   */
+  private trackCameraRest(now: number): void {
+    const eps = (this.hfInternal?.meta.ground_size_m ?? 1000) * 1e-5
+    const moving =
+      this.camAnim !== null ||
+      this.northAnim !== null ||
+      this.camera.position.distanceToSquared(this.lastCamPos) > eps * eps ||
+      this.controls.target.distanceToSquared(this.lastCamTarget) > eps * eps
+    this.lastCamPos.copy(this.camera.position)
+    this.lastCamTarget.copy(this.controls.target)
+    if (moving) {
+      this.detailToken++
+      this.detailAbort?.abort()
+      this.detailAbort = null
+      this.lastMoveAt = now
+      this.restHandled = false
+    } else if (!this.restHandled && now - this.lastMoveAt >= DETAIL_REST_MS) {
+      this.restHandled = true
+      void this.refreshDetail()
+    }
+  }
+
+  /**
+   * Fetch a sharper export for just the viewed sub-area and blend it over
+   * the base drape. Failures are deliberately silent - the base texture is
+   * always there, and the service worker replays past fetches offline.
+   */
+  private async refreshDetail(): Promise<void> {
+    const hf = this.hfInternal
+    const kind = this.drapeKind
+    if (!hf || !kind || this.basePending || !this.material.map) return
+    const [bxmin, bymin, bxmax, bymax] = hf.meta.bbox3857
+    const mercW = bxmax - bxmin
+    const mercH = bymax - bymin
+    // Mercator meters over-count ground meters by 1/cos(lat)
+    const mercPerGround = mercW / hf.meta.ground_size_m
+    const half = hf.half
+
+    const pts: [number, number][] = []
+    let cmx = 0
+    let cmy = 0
+    let centerDist = Infinity
+    for (const [nx, ny] of DETAIL_NDC) {
+      this.raycaster.setFromCamera(this.ndcTmp.set(nx, ny), this.camera)
+      const hit = hf.raycast(this.raycaster.ray, this.exag, hf.meta.min_elev)
+      if (!hit) {
+        if (nx === 0 && ny === 0) return
+        continue
+      }
+      const mx = bxmin + ((hit.x + half) / (2 * half)) * mercW
+      const my = bymax - ((hit.z + half) / (2 * half)) * mercH
+      if (nx === 0 && ny === 0) {
+        cmx = mx
+        cmy = my
+        // Scene units are ground meters, so this is the ground distance to
+        // whatever the camera is pointed at
+        centerDist = this.camera.position.distanceTo(hit)
+      }
+      pts.push([mx, my])
+    }
+    if (pts.length < 3) return
+    if (centerDist > DETAIL_MAX_SPAN_M) {
+      // Looking at distant ground: a lingering patch would show its
+      // scale-dependent styling as a mismatched rectangle in the overview
+      if (this.detailTexture) this.clearDetail()
+      return
+    }
+    // Size the patch from the hits near the look-at point only - top-edge
+    // rays in an up-slope composition land kilometres away, and the patch
+    // serves the ground the eye is on, not the whole frame.
+    const nearMerc = DETAIL_NEAR_M * mercPerGround
+    let minX = Infinity
+    let maxX = -Infinity
+    let minY = Infinity
+    let maxY = -Infinity
+    for (const [mx, my] of pts) {
+      if (Math.abs(mx - cmx) > nearMerc || Math.abs(my - cmy) > nearMerc) continue
+      if (mx < minX) minX = mx
+      if (mx > maxX) maxX = mx
+      if (my < minY) minY = my
+      if (my > maxY) maxY = my
+    }
+    const spanMerc = Math.max(maxX - minX, maxY - minY)
+
+    // Square sub-bbox around the visible extent, clamped inside the area.
+    // Edges snapped to a 50 m grid so near-identical views produce the same
+    // URL and revisits collide with the service worker's cached entries.
+    let side = THREE.MathUtils.clamp(
+      spanMerc * 1.15,
+      DETAIL_MIN_SPAN_M * mercPerGround,
+      DETAIL_PATCH_CAP_M * mercPerGround,
+    )
+    // Not worth a fetch unless the patch clearly out-resolves the bound
+    // base texture, whatever size that was exported at
+    const basePx = (this.material.map.image as { width?: number } | null)?.width ?? 2048
+    if (side * basePx * 1.5 > mercW * DETAIL_SIZE) {
+      // A bound patch from a closer zoom no longer out-resolves the base at
+      // this distance either - drop it (the sw cache makes refetch free)
+      if (this.detailTexture) this.clearDetail()
+      return
+    }
+    side = Math.ceil(side / 50) * 50
+    const sxmin =
+      Math.round(THREE.MathUtils.clamp((minX + maxX - side) / 2, bxmin, bxmax - side) / 50) * 50
+    const symin =
+      Math.round(THREE.MathUtils.clamp((minY + maxY - side) / 2, bymin, bymax - side) / 50) * 50
+    const bbox: Bbox = [sxmin, symin, sxmin + side, symin + side]
+
+    // Close enough to the patch already showing - nothing to refetch
+    const prev = this.detailBbox
+    if (
+      prev &&
+      Math.abs(prev[2] - prev[0] - side) < side * 0.2 &&
+      Math.abs((prev[0] + prev[2]) / 2 - (sxmin + side / 2)) < side * 0.15 &&
+      Math.abs((prev[1] + prev[3]) / 2 - (symin + side / 2)) < side * 0.15
+    ) {
+      return
+    }
+
+    const token = ++this.detailToken
+    this.detailAbort?.abort()
+    const abort = new AbortController()
+    this.detailAbort = abort
+    let bitmap: ImageBitmap
+    try {
+      const res = await fetch(textureUrl(bbox, kind, DETAIL_SIZE), { signal: abort.signal })
+      if (!res.ok) return
+      // createImageBitmap decodes the 2048px image off the main thread.
+      // ImageBitmap uploads ignore UNPACK_FLIP_Y_WEBGL, so the flip that
+      // TextureLoader would apply at upload (terrain UVs put v = 1 at
+      // north, the image's top row) is baked in at decode instead;
+      // premultiply is off to match the loader path's upload
+      bitmap = await createImageBitmap(await res.blob(), {
+        imageOrientation: 'flipY',
+        premultiplyAlpha: 'none',
+      })
+    } catch {
+      // Abort and network failures are equally silent
+      return
+    }
+    if (token !== this.detailToken || kind !== this.drapeKind || !this.material.map) {
+      bitmap.close()
+      return
+    }
+    const tex = new THREE.Texture(bitmap)
+    tex.flipY = false
+    tex.needsUpdate = true
+    tex.colorSpace = THREE.SRGBColorSpace
+    tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy())
+    this.detailTexture?.dispose()
+    this.detailTexture = tex
+    this.detailBbox = bbox
+    this.drapeUniforms.uDetailMap.value = tex
+    this.drapeUniforms.uDetailWindow.value.set(
+      (sxmin - bxmin) / mercW,
+      (symin - bymin) / mercH,
+      side / mercW,
+      side / mercH,
+    )
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      this.drapeUniforms.uDetailFade.value = 1
+      this.detailFade = null
+    } else {
+      this.drapeUniforms.uDetailFade.value = 0
+      this.detailFade = { start: performance.now() }
+    }
   }
 
   /**
@@ -474,6 +861,14 @@ export class Viewer {
     }
     this.controls.update()
 
+    const now = performance.now()
+    this.trackCameraRest(now)
+    if (this.detailFade) {
+      const t = Math.min((now - this.detailFade.start) / 300, 1)
+      this.drapeUniforms.uDetailFade.value = t
+      if (t >= 1) this.detailFade = null
+    }
+
     const roseDeg = THREE.MathUtils.radToDeg(this.controls.getAzimuthalAngle())
     if (Math.abs(roseDeg - this.lastRoseDeg) > 0.2) {
       this.lastRoseDeg = roseDeg
@@ -506,6 +901,10 @@ export class Viewer {
     this.notePinTexture.dispose()
     this.summitTexture?.dispose()
     this.terrain?.geometry.dispose()
+    this.detailAbort?.abort()
+    if (this.hillshadeTimer !== null) clearTimeout(this.hillshadeTimer)
+    this.detailTexture?.dispose()
+    this.hillshadeTexture?.dispose()
     this.material.map?.dispose()
     this.material.dispose()
     this.controls.dispose()

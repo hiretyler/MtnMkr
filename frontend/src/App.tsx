@@ -107,6 +107,12 @@ export default function App() {
   const [units, setUnits] = useState<Units>(() =>
     localStorage.getItem('mtnmkr-units') === 'imperial' ? 'imperial' : 'metric',
   )
+  // Hillshade strength over the topo/imagery drape, in whole percent.
+  // Validated on read - never trust localStorage.
+  const [relief, setRelief] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem('mtnmkr-relief') ?? '', 10)
+    return Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : 35
+  })
   const [radiusKm, setRadiusKm] = useState(4)
   const [size, setSize] = useState(1024)
   const [center, setCenter] = useState<{ lat: number; lon: number; name: string | null } | null>(
@@ -203,7 +209,9 @@ export default function App() {
     if (!viewer || !meta) return
     if (layer === 'shaded') {
       viewer.setShaded()
+      viewer.setDrapeKind(null)
     } else if (layer === 'topo' || layer === 'imagery') {
+      viewer.setDrapeKind(layer)
       if (textures) {
         const url = textures[layer]
         const label = layer === 'topo' ? 'USGS topo' : 'satellite'
@@ -222,6 +230,7 @@ export default function App() {
         })
       }
     } else {
+      viewer.setDrapeKind(null)
       const id = layer.slice('custom:'.length)
       const cl = customLayers.find((c) => c.id === id)
       if (cl) viewer.setTextureUrl(cl.url).catch(showError)
@@ -252,6 +261,13 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('mtnmkr-units', units)
   }, [units])
+
+  useEffect(() => {
+    viewerRef.current?.setReliefStrength(relief / 100)
+    // Persist debounced - the slider fires per pixel of drag
+    const t = setTimeout(() => localStorage.setItem('mtnmkr-relief', String(relief)), 200)
+    return () => clearTimeout(t)
+  }, [relief])
 
   // Summit benchmark. For a named peak, hill-climb from its coordinates
   // to the local maximum - the peak the user asked for, never a taller
@@ -1067,6 +1083,20 @@ export default function App() {
               Add GeoTIFF layer
             </button>
           )}
+          <label className="field">
+            <span>
+              Relief <em className="mono">{relief}%</em>
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={relief}
+              disabled={!meta || layer === 'shaded' || layer.startsWith('custom:')}
+              onChange={(e) => setRelief(parseInt(e.target.value, 10))}
+            />
+          </label>
           <label className="field">
             <span>
               Vertical exaggeration <em className="mono">{exag.toFixed(1)}x</em>
