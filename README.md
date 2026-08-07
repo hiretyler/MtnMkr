@@ -38,6 +38,14 @@ for its shared disk cache, and required only for user-uploaded GeoTIFFs. See
   you upload (scanned quads, drone orthos) - warped onto the terrain
   server-side. GeoTIFF upload is the one feature that needs a backend; the
   control hides itself when there is none.
+- **Zoom detail**: rest the camera looking at ground closer than ~3 km on the
+  topo or satellite layer and a sharper USGS export of just that sub-area
+  (down to ~0.3 m/px) fades in over the base texture. Fully client-side;
+  patches replay offline once fetched.
+- **Relief shading**: a slider blends a Lambertian hillshade (computed from
+  the heightfield in the browser) into the drape. NAIP is flown at high sun
+  angles on purpose - it is an agriculture program - so the imagery is
+  accurate but flat; this puts the shape back.
 - **Tracks**: GPX, KML, and KMZ (including Google Earth `gx:Track` and Google
   My Maps exports) draped onto the surface. Waypoints and placemarks import as
   notes.
@@ -306,13 +314,32 @@ row 0 = north edge.
   "m/px" figure shown in the Peak Data panel is the grid spacing you requested,
   not a guarantee that lidar exists for every pixel.
 
-## Photogrammetry (phase 2)
+## Photogrammetry and 3D scans (phase 2 - not started)
 
 Photos currently contribute as geo-anchored overlays, not geometry. The
-planned seam for structure-from-motion refinement (COLMAP against the 3DEP
-heightfield) is documented in `backend/app/photogrammetry.py`; the frontend
-already treats heights as a fetched artifact, so a refined DEM is just
-another endpoint.
+original server-side seam (COLMAP structure-from-motion registered to the
+3DEP heightfield via ICP) is documented in `backend/app/photogrammetry.py`,
+but the deployed app is backendless, so the current plan keeps user scans
+client-local instead:
+
+1. **Phase 1 - splat/scan overlay**: import a `.ply`/`.spz`/`.splat` (or
+   mesh) the user made with an on-device tool - Scaniverse processes
+   gaussian splats entirely on-phone; desktop users have COLMAP or
+   RealityCapture - and render it over the terrain with a three.js splat
+   renderer. Georegistration by EXIF GPS seed plus the existing manual
+   place/rotate/scale flow; persistence in IndexedDB/OPFS (scan files are
+   too big for the project-JSON data-URL pattern), opt-in for exports.
+2. **Phase 2 - ICP snap**: refine placement by iterative closest point
+   between the scan's points and the in-memory 1 m lidar heightfield -
+   cheap in the browser, and the same registration idea as the old seam.
+
+Full in-browser structure-from-motion is not realistic today (no production
+COLMAP in WASM; in-browser splat training is research-grade), which is why
+reconstruction stays on the user's device in an existing tool. DEM
+refinement from scans is deliberately deprioritized: 3DEP is already 1 m
+lidar, so fused geometry only wins at very close range, while a splat
+overlay adds what the DEM can never have - photoreal rock color, trees,
+the camp itself.
 
 ## Data sources and licensing
 
