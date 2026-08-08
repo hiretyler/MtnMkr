@@ -78,7 +78,9 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [layer, setLayer] = useState<BaseLayer>('shaded')
   const [customLayers, setCustomLayers] = useState<CustomLayer[]>([])
-  const [exag, setExag] = useState(1)
+  // Exaggeration is pinned: the slider is gone, but the plumbing stays so
+  // exports and saved sessions keep a well-defined value
+  const exag = 1
   const [mode, setMode] = useState<Mode>({ type: 'idle' })
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -113,11 +115,12 @@ export default function App() {
     const v = parseInt(localStorage.getItem('mtnmkr-relief') ?? '', 10)
     return Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : 35
   })
-  // Sun position for relief shading: compass azimuth (0 = light from the
-  // north) and altitude above the horizon, both degrees
+  // Sun position for relief shading: compass azimuth constrained to the
+  // real daily arc - east (90) through south to west (270) - and altitude
+  // above the horizon, both degrees
   const [sunAz, setSunAz] = useState<number>(() => {
     const v = parseInt(localStorage.getItem('mtnmkr-sun-az') ?? '', 10)
-    return Number.isFinite(v) ? Math.min(359, Math.max(0, v)) : 315
+    return Number.isFinite(v) ? Math.min(270, Math.max(90, v)) : 135
   })
   const [sunAlt, setSunAlt] = useState<number>(() => {
     const v = parseInt(localStorage.getItem('mtnmkr-sun-alt') ?? '', 10)
@@ -212,10 +215,6 @@ export default function App() {
   useEffect(() => {
     viewerRef.current?.setOverlays(overlays, selectedId)
   }, [overlays, selectedId, meta, exag])
-
-  useEffect(() => {
-    viewerRef.current?.setExaggeration(exag)
-  }, [exag])
 
   useEffect(() => {
     const viewer = viewerRef.current
@@ -443,7 +442,6 @@ export default function App() {
       if (saved) {
         if (saved.overlays.length) setOverlays(saved.overlays)
         setLayer(saved.layer)
-        setExag(saved.exaggeration)
         setUnits(saved.units)
       }
       const p = new URLSearchParams(location.hash.slice(1))
@@ -710,7 +708,6 @@ export default function App() {
       if (pf.version !== 1) throw new Error('Unsupported project file version')
       setRadiusKm(pf.area.radius_km)
       setSize(pf.area.size)
-      setExag(pf.exaggeration)
       await loadAreaAt(pf.area.lat, pf.area.lon, pf.area.name, pf.area.radius_km, pf.area.size)
       setOverlays(pf.overlays)
       setLayer(pf.layer)
@@ -1152,8 +1149,8 @@ export default function App() {
             </span>
             <input
               type="range"
-              min={0}
-              max={359}
+              min={90}
+              max={270}
               step={1}
               value={sunAz}
               disabled={!meta}
@@ -1172,19 +1169,6 @@ export default function App() {
               value={sunAlt}
               disabled={!meta}
               onChange={(e) => setSunAlt(parseInt(e.target.value, 10))}
-            />
-          </label>
-          <label className="field">
-            <span>
-              Vertical exaggeration <em className="mono">{exag.toFixed(1)}x</em>
-            </span>
-            <input
-              type="range"
-              min={0.5}
-              max={3}
-              step={0.1}
-              value={exag}
-              onChange={(e) => setExag(parseFloat(e.target.value))}
             />
           </label>
         </section>

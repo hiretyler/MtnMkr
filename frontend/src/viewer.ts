@@ -146,7 +146,7 @@ export class Viewer {
   private basePending = false
   private reliefStrength = 0
   private sun: THREE.DirectionalLight
-  private sunAz = 315
+  private sunAz = 135
   private sunAlt = 45
   private sunTimer: ReturnType<typeof setTimeout> | null = null
   private hillshadeTexture: THREE.DataTexture | null = null
@@ -205,7 +205,7 @@ export class Viewer {
     const hemi = new THREE.HemisphereLight(0xe8f0f7, 0x8a7f6a, 0.85)
     this.scene.add(hemi)
     this.sun = new THREE.DirectionalLight(0xfff2de, 2.0)
-    // Cartographic convention: lit from the northwest until told otherwise
+    // Morning sun in the southeast until told otherwise
     this.placeSun()
     this.scene.add(this.sun)
     this.scene.add(this.overlayGroup)
