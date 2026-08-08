@@ -253,6 +253,77 @@ input[type='range'] {
   min-height: 1em;
 }
 
+.shade-panel {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 40;
+  width: min(320px, calc(100% - 24px));
+  background: var(--paper);
+  border: 1px solid var(--ink);
+  box-shadow: 3px 3px 0 rgba(42, 33, 24, 0.25);
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+/* display: flex would defeat the hidden attribute */
+.shade-panel[hidden] {
+  display: none;
+}
+
+.shade-close {
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-height: 0;
+  padding: 4px 10px;
+  border: none;
+  background: none;
+  font-size: 18px;
+}
+
+.shade-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shade-row > span:first-child {
+  flex: 0 0 74px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-soft);
+}
+
+.shade-row input[type='range'] {
+  flex: 1;
+  min-width: 40px;
+}
+
+.shade-val {
+  flex: 0 0 52px;
+  text-align: right;
+  font-size: 11px;
+}
+
+.shade-row select {
+  flex: 1;
+  background: var(--paper-raised);
+  border: 1px solid var(--ink);
+  padding: 5px 7px;
+  font: inherit;
+  font-size: 13px;
+  color: inherit;
+}
+
+.shade-btn {
+  flex: 0 0 auto;
+}
+
 .hud {
   position: absolute;
   left: 50%;

@@ -57,8 +57,10 @@ directly (they send CORS on the image responses).
   cast shadows + sky-view AO, slope-angle tint, contour overlay, and
   DEM-backed detail-patch shading all verified in-browser at the state and
   network level; the close-zoom detail-shade pixels still want one human
-  eyeball pass. The standalone HTML/ePub export viewer has none of these
-  yet (fixed NW sun, no worker by design - see ViewerOptions.lightingWorker).
+  eyeball pass. The HTML/ePub exports now carry the whole suite too (relief
+  slider + Shading panel; worker base64-inlined via ?worker&inline and
+  spawned from a blob URL, sync no-shadow bake as fallback) - verified over
+  http and as strict XHTML, but not yet on an actual iPhone in Books.
 - Browser-automation aid: in dev builds the live Viewer instance is exposed
   as `window.__viewer` - drive the camera/private methods directly instead
   of synthetic wheel events (the hidden-tab parking gotcha above).

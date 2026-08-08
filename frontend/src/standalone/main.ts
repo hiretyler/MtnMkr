@@ -10,8 +10,13 @@ import {
   parseLatLon,
   trackLengthKm,
 } from '../geo'
+// Base64-inlined into this bundle and spawned from a blob URL, so the
+// single-file file:// export keeps cast shadows and ambient occlusion
+// without a second file to load. Where blob workers are refused (some
+// XHTML/webview hosts), the viewer falls back to the synchronous bake.
+import LightingWorker from '../lighting-worker?worker&inline'
 import type { NoteOverlay, Overlay } from '../types'
-import { fmtDistKm, fmtElev, fmtRes, type Units } from '../units'
+import { contourChoices, fmtDistKm, fmtElev, fmtRes, nearestContour, type Units } from '../units'
 import { Viewer } from '../viewer'
 import { decodeHeights } from './codec'
 import { PAYLOAD_SCRIPT_ID, type PayloadLayer, type StandalonePayload } from './payload'
@@ -108,6 +113,34 @@ function bootInner(app: HTMLElement): void {
         <div class="hud mono">Drag to orbit · pinch to zoom · tap terrain to measure</div>
         <button class="toast" hidden=""></button>
         <div class="card" hidden=""></div>
+        <div class="shade-panel" hidden="">
+          <button class="shade-close" aria-label="Close">×</button>
+          <div class="here-title">Shading</div>
+          <label class="shade-row">
+            <span>Sun dir</span>
+            <input class="sun-az" type="range" min="90" max="270" step="1" aria-label="Sun direction" />
+            <span class="shade-val sun-az-val mono"></span>
+          </label>
+          <label class="shade-row">
+            <span>Sun height</span>
+            <input class="sun-alt" type="range" min="5" max="85" step="1" aria-label="Sun height above horizon" />
+            <span class="shade-val sun-alt-val mono"></span>
+          </label>
+          <label class="shade-row">
+            <span>Ambient</span>
+            <input class="ao" type="range" min="0" max="100" step="1" aria-label="Ambient occlusion" />
+            <span class="shade-val ao-val mono"></span>
+          </label>
+          <label class="shade-row">
+            <span>Slope</span>
+            <input class="slope" type="range" min="0" max="100" step="1" aria-label="Slope-angle shading" />
+            <span class="shade-val slope-val mono"></span>
+          </label>
+          <label class="shade-row">
+            <span>Contours</span>
+            <select class="contours" aria-label="Contour interval"></select>
+          </label>
+        </div>
         <div class="here-panel" hidden="">
           <button class="here-close" aria-label="Close">×</button>
           <div class="here-title">Mark my position</div>
@@ -129,9 +162,10 @@ function bootInner(app: HTMLElement): void {
         <div class="layers"></div>
         <label class="exag">
           <span class="exag-name">Relief</span>
-          <input type="range" min="0.5" max="3" step="0.1" aria-label="Vertical exaggeration" />
+          <input type="range" min="0" max="100" step="1" aria-label="Relief shading strength" />
           <span class="exag-val mono"></span>
         </label>
+        <button class="shade-btn">Shading</button>
         <div class="foot mono"></div>
       </footer>
       <div class="lightbox" hidden=""><img alt="Photo at full size" /></div>
@@ -221,9 +255,13 @@ function bootInner(app: HTMLElement): void {
       // Direct DOM write - this fires from the render loop
       rose.style.transform = `rotate(${roseDeg}deg)`
     },
+  }, {
+    lightingWorker: () => new LightingWorker(),
   })
 
   viewer.setTerrain(payload.area, heights)
+  // Fixed at export time - the app pins exaggeration at 1x now, but older
+  // project exports may carry another value and should look as they did
   viewer.setExaggeration(payload.exaggeration)
   viewer.setOverlays(overlays, null)
 
@@ -248,11 +286,18 @@ function bootInner(app: HTMLElement): void {
 
   function applyLayer(layer: PayloadLayer): void {
     if (layer.kind === 'texture' && layer.dataUrl) {
+      // Relief, AO, and the online zoom-detail patch key off which base
+      // drape is showing; custom layers pass null and get shader features
+      // (slope, contours) only, same as the app
+      viewer.setDrapeKind(
+        layer.id === 'topo' || layer.id === 'imagery' ? layer.id : null,
+      )
       viewer
         .setTextureUrl(layer.dataUrl)
         .catch(() => showToast(`Could not load the ${layer.name} layer`))
     } else {
       viewer.setShaded()
+      viewer.setDrapeKind(null)
     }
     for (const b of layersEl.querySelectorAll('button')) {
       b.classList.toggle('active', b.dataset.id === layer.id)
@@ -270,17 +315,90 @@ function bootInner(app: HTMLElement): void {
   if (initialLayer) applyLayer(initialLayer)
   else viewer.setShaded()
 
-  // ---- exaggeration -----------------------------------------------------
+  // ---- relief + shading -------------------------------------------------
 
-  exagInput.value = String(payload.exaggeration)
-  function renderExag(): void {
-    exagVal.textContent = `${parseFloat(exagInput.value).toFixed(1)}x`
+  let relief = 35
+  exagInput.value = String(relief)
+  function applyRelief(): void {
+    exagVal.textContent = `${relief}%`
+    viewer.setReliefStrength(relief / 100)
   }
   exagInput.addEventListener('input', () => {
-    viewer.setExaggeration(parseFloat(exagInput.value))
-    renderExag()
+    relief = parseInt(exagInput.value, 10)
+    applyRelief()
   })
-  renderExag()
+  applyRelief()
+
+  const shadePanel = $('.shade-panel')
+  const sunAzInput = $('.sun-az') as HTMLInputElement
+  const sunAltInput = $('.sun-alt') as HTMLInputElement
+  const aoInput = $('.ao') as HTMLInputElement
+  const slopeInput = $('.slope') as HTMLInputElement
+  const contourSelect = $('.contours') as HTMLSelectElement
+
+  let sunAz = 135
+  let sunAlt = 45
+  let ao = 40
+  let slope = 0
+  let contourM = 0
+  sunAzInput.value = String(sunAz)
+  sunAltInput.value = String(sunAlt)
+  aoInput.value = String(ao)
+  slopeInput.value = String(slope)
+
+  function applyShading(): void {
+    $('.sun-az-val').textContent = `${compassPoint(sunAz)} ${sunAz}°`
+    $('.sun-alt-val').textContent = `${sunAlt}°`
+    $('.ao-val').textContent = `${ao}%`
+    $('.slope-val').textContent = `${slope}%`
+    viewer.setSunPosition(sunAz, sunAlt)
+    viewer.setAoStrength(ao / 100)
+    viewer.setSlopeShading(slope / 100)
+    viewer.setContourInterval(contourM)
+  }
+
+  function renderContourOptions(): void {
+    contourSelect.replaceChildren()
+    const off = el('option', undefined, 'Off')
+    off.value = '0'
+    contourSelect.appendChild(off)
+    for (const c of contourChoices(units)) {
+      const o = el('option', undefined, c.label)
+      o.value = String(c.meters)
+      contourSelect.appendChild(o)
+    }
+    contourSelect.value = String(contourM)
+  }
+  renderContourOptions()
+
+  sunAzInput.addEventListener('input', () => {
+    sunAz = parseInt(sunAzInput.value, 10)
+    applyShading()
+  })
+  sunAltInput.addEventListener('input', () => {
+    sunAlt = parseInt(sunAltInput.value, 10)
+    applyShading()
+  })
+  aoInput.addEventListener('input', () => {
+    ao = parseInt(aoInput.value, 10)
+    applyShading()
+  })
+  slopeInput.addEventListener('input', () => {
+    slope = parseInt(slopeInput.value, 10)
+    applyShading()
+  })
+  contourSelect.addEventListener('change', () => {
+    contourM = parseFloat(contourSelect.value)
+    applyShading()
+  })
+  applyShading()
+
+  ;($('.shade-btn') as HTMLButtonElement).addEventListener('click', () => {
+    shadePanel.hidden = !shadePanel.hidden
+  })
+  ;($('.shade-close') as HTMLButtonElement).addEventListener('click', () => {
+    shadePanel.hidden = true
+  })
 
   const compassBtn = $('.compass') as HTMLButtonElement
   compassBtn.addEventListener('click', () => viewer.faceNorth())
@@ -308,6 +426,11 @@ function bootInner(app: HTMLElement): void {
       b.addEventListener('click', () => {
         if (units === u) return
         units = u
+        // Keep the drawn interval and the select's label in agreement:
+        // snap to the nearest choice the new unit system offers
+        contourM = contourM > 0 ? nearestContour(contourM, u) : 0
+        renderContourOptions()
+        applyShading()
         renderTopMeta()
         renderSummit()
         renderCard()

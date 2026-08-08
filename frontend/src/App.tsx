@@ -24,7 +24,17 @@ import { findBaked } from './direct/prebake'
 import { textureUrl as usgsTextureUrl } from './direct/usgs'
 import { search as gazetteerSearch } from './direct/gazetteer'
 import { applyUpdate, clearCachedTerrain, onUpdateReady } from './sw-client'
-import { elevDisplay, elevTickStep, fmtDistKm, fmtElev, fmtRes, type Units } from './units'
+import {
+  CONTOUR_METERS,
+  contourChoices,
+  elevDisplay,
+  elevTickStep,
+  fmtDistKm,
+  fmtElev,
+  fmtRes,
+  nearestContour,
+  type Units,
+} from './units'
 import type {
   AreaMeta,
   BaseLayer,
@@ -51,30 +61,6 @@ const SIZES = [
   { value: 1024, label: '1024 - standard' },
   { value: 2048, label: '2048 - maximum' },
 ]
-
-// Contour intervals on offer. The choice is stored in metres whichever unit
-// system is showing, so a units switch only re-labels it - snapped to the
-// nearest interval the new system offers, which keeps the select's label and
-// the lines on the mountain describing the same spacing.
-const M_PER_FT = 0.3048
-const CONTOUR_M = [10, 25, 50, 100]
-const CONTOUR_FT = [40, 80, 200, 500]
-const CONTOUR_METERS = [...CONTOUR_M, ...CONTOUR_FT.map((ft) => ft * M_PER_FT)]
-
-function contourChoices(units: Units): { meters: number; label: string }[] {
-  return units === 'metric'
-    ? CONTOUR_M.map((m) => ({ meters: m, label: `${m} m` }))
-    : CONTOUR_FT.map((ft) => ({ meters: ft * M_PER_FT, label: `${ft} ft` }))
-}
-
-function nearestContour(meters: number, units: Units): number {
-  const choices = contourChoices(units)
-  let best = choices[0].meters
-  for (const c of choices) {
-    if (Math.abs(c.meters - meters) < Math.abs(best - meters)) best = c.meters
-  }
-  return best
-}
 
 function uid(): string {
   return crypto.randomUUID().slice(0, 8)
