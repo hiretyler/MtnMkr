@@ -3,13 +3,15 @@ import { MapControls } from 'three/addons/controls/MapControls.js'
 import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
-import { textureUrl, type Bbox } from './direct/usgs'
+import { decodeFloat32Tiff, type DecodedRaster } from './direct/tiff'
+import { demUrl, textureUrl, type Bbox } from './direct/usgs'
 import {
   buildHillshadeTexture,
   buildTerrainGeometry,
   Heightfield,
   projectTrackSegment,
 } from './geo'
+import type { LightingJob, LightingResult } from './lighting-worker'
 import {
   makeNotePinTexture,
   makePhotoPinTexture,
@@ -26,6 +28,18 @@ export interface SummitInfo {
   label: string
   /** Peak name shown above the elevation, when the load was a named peak */
   name?: string | null
+}
+
+export interface ViewerOptions {
+  /**
+   * Factory for the terrain lighting bake worker. Injected rather than
+   * constructed in here so that this module's graph stays worker-free: the
+   * standalone export is a single-chunk IIFE bundle, and a
+   * `new Worker( new URL( ... ) )` anywhere in it makes the build emit a
+   * second file that a file:// export has no way to load. Omit it and the
+   * bakes fall back to the synchronous geo.ts hillshade.
+   */
+  lightingWorker?: () => Worker
 }
 
 export interface ViewerEvents {
@@ -63,6 +77,14 @@ const DETAIL_NEAR_M = 1500
 // out-resolving a 4096 base, and the sharpness gate would veto anyway.
 const DETAIL_PATCH_CAP_M = 2500
 const DETAIL_SIZE = 2048
+// Patch DEM export sizes for the detail hillshade bake, chosen per patch:
+// the smallest power of two putting at least 3x the base grid's samples
+// across the window, so the rebaked shading clearly out-resolves the base
+// bake instead of resampling it. Capped at 1024 (~2.4 m/px over the 2.5 km
+// patch cap) because each doubling quadruples the worker's horizon-march
+// cost for frequencies the shadow's soft penumbra blurs away anyway.
+const DETAIL_DEM_MIN = 256
+const DETAIL_DEM_MAX = 1024
 // Idle time before the camera counts as at rest
 const DETAIL_REST_MS = 500
 
@@ -80,12 +102,23 @@ const DETAIL_NDC: readonly (readonly [number, number])[] = [
   [0.85, 0.85],
 ]
 
+// Stands in for the contour interval while contours are off: the shader
+// divides by it unconditionally, and a 0 there would be a NaN waiting for
+// the next frame that turns them on.
+const CONTOUR_FALLBACK_M = 50
+
 // Replaces three's map_fragment chunk. Everything sits inside USE_MAP, so
 // the untextured 'shaded' layer compiles to the stock shader and renders
 // exactly as before. The detail patch blends over the base drape inside its
-// UV window with a smoothstep edge; the hillshade then multiplies both.
-// Texture samples stay in dynamically-uniform control flow so the implicit
-// mipmap derivatives remain defined.
+// UV window with a smoothstep edge; the hillshade and the sky-view ambient
+// occlusion then multiply both, and the slope tint and contour ink go on
+// last so map furniture sits over the shading rather than under it. When a
+// patch hillshade is live it replaces the base hillshade inside the same
+// window rather than multiplying over it - both bakes shadow the same sun,
+// so stacking them would darken every shadowed texel twice. Texture
+// samples stay in dynamically-uniform control flow so the implicit mipmap
+// derivatives remain defined, and each strength uniform stays 0 until its
+// bake exists so no branch ever samples three's black fallback texture.
 const DRAPE_MAP_FRAGMENT = /* glsl */ `
 #ifdef USE_MAP
   vec4 sampledDiffuseColor = texture2D( map, vMapUv );
@@ -97,19 +130,139 @@ const DRAPE_MAP_FRAGMENT = /* glsl */ `
     sampledDiffuseColor.rgb = mix( sampledDiffuseColor.rgb, detail, edge.x * edge.y * uDetailFade );
   }
   if ( uRelief > 0.0 ) {
-    sampledDiffuseColor.rgb *= mix( 1.0, texture2D( uHillshadeMap, vMapUv ).r, uRelief );
+    float shade = texture2D( uHillshadeMap, vMapUv ).r;
+    if ( uDetailShadeOn > 0.0 ) {
+      vec2 sUv = ( vMapUv - uDetailWindow.xy ) / uDetailWindow.zw;
+      vec2 sEdge = smoothstep( vec2( 0.0 ), vec2( 0.06 ), sUv )
+        * smoothstep( vec2( 0.0 ), vec2( 0.06 ), vec2( 1.0 ) - sUv );
+      float fine = texture2D( uDetailShadeMap, clamp( sUv, 0.0, 1.0 ) ).r;
+      shade = mix( shade, fine, sEdge.x * sEdge.y * uDetailShadeOn );
+    }
+    sampledDiffuseColor.rgb *= mix( 1.0, shade, uRelief );
+  }
+  if ( uAo > 0.0 ) {
+    // The exponent widens the sky-view factor's narrow range - open terrain
+    // sits close to 1.0 and would otherwise barely read as shaded at all
+    float ao = pow( texture2D( uAoMap, vMapUv ).r, 1.5 );
+    sampledDiffuseColor.rgb *= mix( 1.0, ao, uAo );
+  }
+  if ( uSlope > 0.0 ) {
+    // Steepness of the real ground, not of the model: a vertical stretch
+    // multiplies the surface gradient by uDrapeExag, so dividing the normal's
+    // up component back out is what keeps 38 degrees meaning 38 degrees.
+    // vDrapeNormal rather than three's vNormal because vNormal is view space
+    // and would swing the whole ramp around as the camera orbits.
+    float ny = max( normalize( vDrapeNormal ).y, 0.0 );
+    float slopeDeg = degrees( atan( sqrt( max( 1.0 - ny * ny, 0.0 ) ), ny * uDrapeExag ) );
+    // CalTopo's break points. The two-degree feathers are there so a band
+    // edge crawling across a face does not crawl as a hard jagged line.
+    // Ramped in sRGB and converted once: these are picked as swatches, and
+    // crossfading them in linear light muddies the edges into brown.
+    vec3 ramp = vec3( 1.0, 0.85, 0.2 );
+    ramp = mix( ramp, vec3( 0.95, 0.55, 0.15 ), smoothstep( 31.0, 33.0, slopeDeg ) );
+    ramp = mix( ramp, vec3( 0.85, 0.2, 0.15 ), smoothstep( 37.0, 39.0, slopeDeg ) );
+    ramp = mix( ramp, vec3( 0.55, 0.2, 0.55 ), smoothstep( 44.0, 46.0, slopeDeg ) );
+    ramp = mix( ramp, vec3( 0.35, 0.35, 0.55 ), smoothstep( 54.0, 56.0, slopeDeg ) );
+    float band = smoothstep( 26.0, 28.0, slopeDeg );
+    sampledDiffuseColor.rgb = mix( sampledDiffuseColor.rgb, drapeSrgb( ramp ), band * uSlope );
+  }
+  if ( uContours > 0.0 ) {
+    // vDrapePos is object space, which is scene space for this mesh, so
+    // undoing the vertical stretch recovers metres above sea level
+    float t = ( vDrapePos.y / uDrapeExag + uMinElev ) / uContourInterval;
+    // The index contour rides its own fifth-scale coordinate: five intervals
+    // of real spacing, so it stays legible for five times the zoom-out the
+    // intermediates survive, and it is wider and darker where both land
+    float ink = max( 0.8 * drapeContour( t, 1.0 ), drapeContour( t * 0.2, 1.6 ) );
+    // Warm dark brown - reads as ink on the topo's pale paper and still
+    // separates from the satellite layer's greens and shadowed rock
+    vec3 contourInk = drapeSrgb( vec3( 0.24, 0.18, 0.12 ) );
+    sampledDiffuseColor.rgb = mix( sampledDiffuseColor.rgb, contourInk, ink * uContours );
   }
   diffuseColor *= sampledDiffuseColor;
 #endif
 `
 
+// Prepended to the fragment shader. The two varyings carry what three does
+// not hand the fragment shader in a usable frame: the pre-projection position
+// (object space, so elevation survives) and the object-space normal (vNormal
+// is view space).
 const DRAPE_UNIFORM_DECLS = /* glsl */ `
 uniform sampler2D uDetailMap;
 uniform vec4 uDetailWindow;
 uniform float uDetailFade;
+uniform sampler2D uDetailShadeMap;
+uniform float uDetailShadeOn;
 uniform sampler2D uHillshadeMap;
 uniform float uRelief;
+uniform sampler2D uAoMap;
+uniform float uAo;
+uniform float uDrapeExag;
+uniform float uMinElev;
+uniform float uContourInterval;
+uniform float uContours;
+uniform float uSlope;
+varying vec3 vDrapePos;
+varying vec3 vDrapeNormal;
+
+// The drape is sRGB-decoded by the sampler before any of this runs, so the
+// map furniture below is written as sRGB swatches and converted here. Dropped
+// in raw they would land as pale pastels, and the contour ink in particular
+// would come out lighter than the satellite layer's forest - lines that flip
+// from ink to highlight depending on what is underneath them. Every call site
+// passes a constant, so this folds away at compile time.
+vec3 drapeSrgb( vec3 c ) {
+  return mix( c / 12.92, pow( ( c + 0.055 ) / 1.055, vec3( 2.4 ) ), step( 0.04045, c ) );
+}
+
+// One anti-aliased isoline field: t is elevation in interval units, so the
+// integers are the lines and fwidth( t ) is how much of an interval one pixel
+// covers. Everything is measured against that, which is what holds the lines
+// at a fixed screen width from summit close-up to whole-range overview. Past
+// ~4 px per interval no line can be drawn honestly, so it fades out - moire
+// is worse than an absent contour.
+float drapeContour( float t, float width ) {
+  // Floored because smoothstep is undefined when its two edges meet, and a
+  // dead-flat surface - a lake, a nodata fill - has a derivative of exactly 0
+  float w = max( fwidth( t ), 1e-6 );
+  float d = abs( t - round( t ) );
+  float line = 1.0 - smoothstep( 0.75 * w * width, 1.5 * w * width, d );
+  return line * ( 1.0 - smoothstep( 0.15, 0.28, w ) );
+}
 `
+
+const DRAPE_VERTEX_DECLS = /* glsl */ `
+varying vec3 vDrapePos;
+varying vec3 vDrapeNormal;
+`
+
+/**
+ * Wrap a worker bake as a texture, matching what the terrain UVs expect: one
+ * byte per texel, rows already flipped by the bake so v = 1 is north.
+ */
+function singleChannelTexture(data: Uint8Array, w: number, h: number): THREE.DataTexture {
+  const tex = new THREE.DataTexture(data, w, h, THREE.RedFormat, THREE.UnsignedByteType)
+  tex.minFilter = THREE.LinearMipmapLinearFilter
+  tex.magFilter = THREE.LinearFilter
+  tex.generateMipmaps = true
+  // Single-byte rows are not 4-byte aligned at every width
+  tex.unpackAlignment = 1
+  tex.needsUpdate = true
+  return tex
+}
+
+// Decoded patch DEM, cached while its patch is live so a sun move rebakes
+// the shade without refetching. Offsets are ground metres from the base
+// grid's northwest corner - the placement the worker's shadow march needs
+// to keep walking once it leaves the patch.
+interface DetailDem {
+  data: Float32Array
+  width: number
+  height: number
+  groundSize: number
+  offE: number
+  offS: number
+}
 
 export class Viewer {
   private renderer: THREE.WebGLRenderer
@@ -129,15 +282,25 @@ export class Viewer {
   private resizeObserver: ResizeObserver
   private textureToken = 0
 
-  // Detail patch + relief shading. drapeUniforms is shared with every
-  // compiled variant of the terrain shader by reference, so writing .value
-  // here reaches the GPU without touching the material.
+  // Detail patch, relief shading, slope tint and contours. drapeUniforms is
+  // shared with every compiled variant of the terrain shader by reference, so
+  // writing .value here reaches the GPU without touching the material.
   private drapeUniforms = {
     uDetailMap: { value: null as THREE.Texture | null },
     uDetailWindow: { value: new THREE.Vector4(0, 0, 1, 1) },
     uDetailFade: { value: 0 },
+    uDetailShadeMap: { value: null as THREE.Texture | null },
+    uDetailShadeOn: { value: 0 },
     uHillshadeMap: { value: null as THREE.Texture | null },
     uRelief: { value: 0 },
+    uAoMap: { value: null as THREE.Texture | null },
+    uAo: { value: 0 },
+    uDrapeExag: { value: 1 },
+    uMinElev: { value: 0 },
+    // Never 0 even while the lines are off - it is a divisor
+    uContourInterval: { value: CONTOUR_FALLBACK_M },
+    uContours: { value: 0 },
+    uSlope: { value: 0 },
   }
   private drapeKind: 'topo' | 'imagery' | null = null
   // True while the bound map is not yet the current kind's base drape (layer
@@ -145,17 +308,38 @@ export class Viewer {
   // layer's pixels over the old layer's texture
   private basePending = false
   private reliefStrength = 0
+  private aoStrength = 0
+  private contourInterval = 0
+  private slopeStrength = 0
   private sun: THREE.DirectionalLight
   private sunAz = 135
   private sunAlt = 45
   private sunTimer: ReturnType<typeof setTimeout> | null = null
   private hillshadeTexture: THREE.DataTexture | null = null
   private hillshadeTimer: ReturnType<typeof setTimeout> | null = null
+  private aoTexture: THREE.DataTexture | null = null
+  // Lazily spawned, and never respawned once it has failed: a webview that
+  // refuses module workers refuses them every time
+  private lighting: Worker | null = null
+  private lightingBroken = false
+  private lightingJob = 0
+  // The one bake of each kind still in flight, with the state it was baked
+  // for - a reply whose id no longer matches, or whose terrain or sun has
+  // moved on, describes something that is no longer on screen
+  private hillshadeReq: { id: number; hf: Heightfield; az: number; alt: number } | null = null
+  private aoReq: { id: number; hf: Heightfield } | null = null
   private detailToken = 0
   private detailAbort: AbortController | null = null
   private detailTexture: THREE.Texture | null = null
   private detailBbox: Bbox | null = null
   private detailFade: { start: number } | null = null
+  // Patch hillshade for the live detail window. The shade record carries the
+  // sun angles it was baked for, so staleness is a comparison rather than a
+  // flag someone has to remember to set.
+  private detailDemAbort: AbortController | null = null
+  private detailDem: DetailDem | null = null
+  private detailShade: { texture: THREE.DataTexture; az: number; alt: number } | null = null
+  private detailShadeReq: { id: number; token: number; az: number; alt: number } | null = null
   // Camera-rest tracking for the detail fetch
   private lastCamPos = new THREE.Vector3()
   private lastCamTarget = new THREE.Vector3()
@@ -193,6 +377,7 @@ export class Viewer {
   constructor(
     private canvas: HTMLCanvasElement,
     private events: ViewerEvents,
+    private opts: ViewerOptions = {},
   ) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true })
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
@@ -220,6 +405,17 @@ export class Viewer {
     // plus USE_MAP, so the shaded and draped variants coexist.
     this.material.onBeforeCompile = (shader) => {
       Object.assign(shader.uniforms, this.drapeUniforms)
+      // Both varyings are written unconditionally, on the shaded layer too:
+      // the vertex shader has no USE_MAP branch to hang them off, and an
+      // unread varying costs one interpolator the terrain has to spare.
+      shader.vertexShader =
+        DRAPE_VERTEX_DECLS +
+        shader.vertexShader
+          .replace(
+            '#include <beginnormal_vertex>',
+            '#include <beginnormal_vertex>\n  vDrapeNormal = objectNormal;',
+          )
+          .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vDrapePos = transformed;')
       shader.fragmentShader =
         DRAPE_UNIFORM_DECLS +
         shader.fragmentShader.replace('#include <map_fragment>', DRAPE_MAP_FRAGMENT)
@@ -269,15 +465,24 @@ export class Viewer {
     }
     this.hfInternal = new Heightfield(meta, heights)
 
-    // The old hillshade and detail patch describe the old terrain, the
-    // bound base texture is stale until the layer effect reloads it, and
-    // any in-flight base load still belongs to the old area
+    // The old hillshade, ambient occlusion and detail patch describe the old
+    // terrain, the bound base texture is stale until the layer effect
+    // reloads it, and any in-flight base load still belongs to the old area
     this.clearDetail()
     this.basePending = true
     this.textureToken++
     this.hillshadeTexture?.dispose()
     this.hillshadeTexture = null
+    this.aoTexture?.dispose()
+    this.aoTexture = null
+    this.hillshadeReq = null
+    this.aoReq = null
     this.drapeUniforms.uHillshadeMap.value = null
+    this.drapeUniforms.uAoMap.value = null
+    // The datum the shader reads elevation back out against - vertex y is
+    // metres above this area's floor, not above sea level
+    this.drapeUniforms.uMinElev.value = meta.min_elev
+    this.drapeUniforms.uDrapeExag.value = Math.max(this.exag, 1e-3)
     this.applyRelief()
 
     const geom = buildTerrainGeometry(this.hfInternal, this.exag)
@@ -318,6 +523,10 @@ export class Viewer {
 
   setExaggeration(exag: number): void {
     this.exag = exag
+    // Contours and the slope ramp both read metres back out of the stretched
+    // vertex y, so this has to move with the geometry. Floored because the
+    // shader divides by it - a flattened terrain is better than a NaN drape.
+    this.drapeUniforms.uDrapeExag.value = Math.max(exag, 1e-3)
     if (!this.terrain || !this.hfInternal) return
     const hf = this.hfInternal
     const posAttr = this.terrain.geometry.getAttribute('position') as THREE.BufferAttribute
@@ -416,6 +625,36 @@ export class Viewer {
   }
 
   /**
+   * Ambient occlusion strength over the drape, 0..1. The sky-view bake it
+   * samples does not depend on the sun, so moving the sun never rebakes it.
+   */
+  setAoStrength(strength: number): void {
+    this.aoStrength = strength
+    this.applyRelief()
+  }
+
+  /**
+   * Elevation contour interval in metres over the drape; 0 turns them off.
+   * Unlike relief and ambient occlusion these are computed per fragment from
+   * the vertex height, so there is no bake to wait for and no texture
+   * resolution to outrun - the lines stay sharp at any zoom.
+   */
+  setContourInterval(meters: number): void {
+    this.contourInterval = meters > 0 ? meters : 0
+    this.drapeUniforms.uContourInterval.value = this.contourInterval || CONTOUR_FALLBACK_M
+    this.drapeUniforms.uContours.value = this.contourInterval > 0 ? 1 : 0
+  }
+
+  /**
+   * Slope-angle tint strength over the drape, 0..1. Also bake-free: the angle
+   * comes from the surface normal the mesh already carries.
+   */
+  setSlopeShading(strength: number): void {
+    this.slopeStrength = THREE.MathUtils.clamp(strength, 0, 1)
+    this.drapeUniforms.uSlope.value = this.slopeStrength
+  }
+
+  /**
    * Sun position: compass azimuth in degrees (0 = sun in the north) and
    * altitude above the horizon. The scene light moves immediately - live
    * feedback on every layer, including the untextured shaded one - while
@@ -432,12 +671,10 @@ export class Viewer {
       this.sunTimer = null
       // Only when a bake is already on screen; otherwise the lazy path in
       // applyRelief builds with the current angles when first needed
-      if (this.hfInternal && this.hillshadeTexture) {
-        const tex = buildHillshadeTexture(this.hfInternal, this.sunAz, this.sunAlt)
-        this.hillshadeTexture.dispose()
-        this.hillshadeTexture = tex
-        this.drapeUniforms.uHillshadeMap.value = tex
-      }
+      if (this.hfInternal && this.hillshadeTexture) this.requestHillshade(this.hfInternal)
+      // Same rule for the patch shade, same no-flicker behavior: the old
+      // bake stays up until one for the new angles lands
+      if (this.hfInternal && this.detailShade) this.requestDetailShade()
     }, 150)
   }
 
@@ -454,25 +691,168 @@ export class Viewer {
 
   private applyRelief(): void {
     const hf = this.hfInternal
-    const on = this.drapeKind !== null && this.reliefStrength > 0 && hf !== null
+    const draped = this.drapeKind !== null && hf !== null
+    const relief = draped && this.reliefStrength > 0
+    const ao = draped && this.aoStrength > 0
     // Live only once the texture exists - the shader would otherwise sample
     // three's black fallback and darken the whole drape
-    this.drapeUniforms.uRelief.value = on && this.hillshadeTexture ? this.reliefStrength : 0
-    // Built lazily (sessions that never show relief never pay the pass) and
-    // off the current tick - the full-grid pass is millions of texels and
-    // would hitch a mid-drag slider frame. One pending build at a time.
-    if (on && hf && !this.hillshadeTexture && this.hillshadeTimer === null) {
+    this.drapeUniforms.uRelief.value = relief && this.hillshadeTexture ? this.reliefStrength : 0
+    this.drapeUniforms.uAo.value = ao && this.aoTexture ? this.aoStrength : 0
+    if (!hf || !draped) return
+    // Baked lazily - a session that never shows relief never pays for either
+    // pass - and one bake of each kind at a time
+    if (relief && !this.hillshadeTexture && !this.hillshadeReq) this.requestHillshade(hf)
+    if ((relief || ao) && !this.aoTexture && !this.aoReq) this.requestAo(hf)
+    // The patch shade waits on relief too - its DEM fetch and bake are
+    // wasted while nothing multiplies them in. This is also what catches a
+    // patch that went live while relief was off; freshness checks inside.
+    if (relief) this.requestDetailShade()
+  }
+
+  /**
+   * The bake worker, spawned on first need. No factory, or a webview that
+   * refuses module workers, gets the geo.ts hillshade instead: no cast
+   * shadows and no ambient occlusion, but relief still works.
+   */
+  private lightingWorker(): Worker | null {
+    if (this.lighting || this.lightingBroken) return this.lighting
+    const make = this.opts.lightingWorker
+    if (!make) {
+      this.lightingBroken = true
+      return null
+    }
+    try {
+      const w = make()
+      w.onmessage = this.onLightingResult
+      // A worker that fails to load reports it here, not at construction
+      w.onerror = () => {
+        this.lightingBroken = true
+        this.lighting?.terminate()
+        this.lighting = null
+        this.hillshadeReq = null
+        this.aoReq = null
+        this.detailShadeReq = null
+        this.applyRelief()
+      }
+      this.lighting = w
+    } catch {
+      this.lightingBroken = true
+      this.lighting = null
+    }
+    return this.lighting
+  }
+
+  // hf.data stays in use on the main thread for picking and draping, and the
+  // patch DEM stays cached for sun rebakes, so every job carries copies -
+  // transferred, not structured-cloned a second time
+  private postLightingJob(job: LightingJob): void {
+    const transfer: ArrayBuffer[] = [job.heights.buffer as ArrayBuffer]
+    if (job.job === 'patchHillshade') transfer.push(job.baseHeights.buffer as ArrayBuffer)
+    this.lighting?.postMessage(job, transfer)
+  }
+
+  private requestHillshade(hf: Heightfield): void {
+    // One bake in flight at a time. The worker drains its queue in order, so
+    // a second job posted mid-drag would only be reached once it was already
+    // stale, and each job carries a copy of the whole DEM; the reply handler
+    // re-fires instead when the sun has moved on.
+    if (this.hillshadeReq) return
+    if (!this.lightingWorker()) {
+      // Off the current tick even synchronously: the full-grid pass would
+      // otherwise hitch the slider frame that asked for it
+      if (this.hillshadeTimer !== null) return
       this.hillshadeTimer = setTimeout(() => {
         this.hillshadeTimer = null
-        if (this.hfInternal === hf && !this.hillshadeTexture) {
-          this.hillshadeTexture = buildHillshadeTexture(hf, this.sunAz, this.sunAlt)
-          this.drapeUniforms.uHillshadeMap.value = this.hillshadeTexture
-        }
-        // Raises uRelief now the texture exists - or reschedules when the
-        // terrain changed while the build waited
+        if (this.hfInternal !== hf) return
+        const tex = buildHillshadeTexture(hf, this.sunAz, this.sunAlt)
+        this.hillshadeTexture?.dispose()
+        this.hillshadeTexture = tex
+        this.drapeUniforms.uHillshadeMap.value = tex
         this.applyRelief()
       }, 0)
+      return
     }
+    const id = ++this.lightingJob
+    this.hillshadeReq = { id, hf, az: this.sunAz, alt: this.sunAlt }
+    this.postLightingJob({
+      job: 'hillshade',
+      jobId: id,
+      heights: hf.data.slice(),
+      width: hf.meta.width,
+      height: hf.meta.height,
+      groundSize: hf.meta.ground_size_m,
+      sunAz: this.sunAz,
+      sunAlt: this.sunAlt,
+    })
+  }
+
+  private requestAo(hf: Heightfield): void {
+    if (!this.lightingWorker()) return
+    const id = ++this.lightingJob
+    this.aoReq = { id, hf }
+    this.postLightingJob({
+      job: 'ao',
+      jobId: id,
+      heights: hf.data.slice(),
+      width: hf.meta.width,
+      height: hf.meta.height,
+      groundSize: hf.meta.ground_size_m,
+    })
+  }
+
+  private onLightingResult = (e: MessageEvent<LightingResult>): void => {
+    const msg = e.data
+    if (msg.job === 'hillshade') {
+      if (!this.hillshadeReq || this.hillshadeReq.id !== msg.jobId) return
+      const req = this.hillshadeReq
+      this.hillshadeReq = null
+      // A bake for terrain that has since been replaced is dropped outright;
+      // applyRelief starts the new terrain's. One for a sun that moved again
+      // while it ran is dropped and re-fired - whatever is already on screen
+      // stays until a bake for the current angles lands.
+      if (req.hf === this.hfInternal) {
+        if (req.az === this.sunAz && req.alt === this.sunAlt) {
+          this.hillshadeTexture?.dispose()
+          this.hillshadeTexture = singleChannelTexture(msg.data, msg.width, msg.height)
+          this.drapeUniforms.uHillshadeMap.value = this.hillshadeTexture
+        } else {
+          this.requestHillshade(req.hf)
+        }
+      }
+    } else if (msg.job === 'patchHillshade') {
+      if (!this.detailShadeReq || this.detailShadeReq.id !== msg.jobId) return
+      const req = this.detailShadeReq
+      this.detailShadeReq = null
+      // Same discipline as the base bake: a reply for a patch that is gone
+      // (token moved on) is dropped outright - the next camera rest re-kicks
+      // if the patch survives - and one for a sun that moved again is
+      // dropped and re-fired from the cached DEM. Whatever shade is on
+      // screen stays up until a bake for the current angles lands.
+      if (req.token === this.detailToken && this.detailBbox) {
+        if (req.az === this.sunAz && req.alt === this.sunAlt) {
+          this.detailShade?.texture.dispose()
+          this.detailShade = {
+            texture: singleChannelTexture(msg.data, msg.width, msg.height),
+            az: req.az,
+            alt: req.alt,
+          }
+          this.drapeUniforms.uDetailShadeMap.value = this.detailShade.texture
+          this.drapeUniforms.uDetailShadeOn.value = 1
+        } else {
+          this.requestDetailShade()
+        }
+      }
+    } else {
+      if (!this.aoReq || this.aoReq.id !== msg.jobId) return
+      const req = this.aoReq
+      this.aoReq = null
+      if (req.hf === this.hfInternal) {
+        this.aoTexture?.dispose()
+        this.aoTexture = singleChannelTexture(msg.data, msg.width, msg.height)
+        this.drapeUniforms.uAoMap.value = this.aoTexture
+      }
+    }
+    this.applyRelief()
   }
 
   private clearDetail(): void {
@@ -485,6 +865,131 @@ export class Viewer {
     this.detailTexture?.dispose()
     this.detailTexture = null
     this.detailBbox = null
+    this.clearDetailShade()
+  }
+
+  // Also called alone when a new patch replaces an old one: the old shade
+  // was baked for the old window and would land misplaced under the new one
+  private clearDetailShade(): void {
+    this.detailDemAbort?.abort()
+    this.detailDemAbort = null
+    this.detailDem = null
+    // In-flight bake replies check this by id, so nulling it is the drop
+    this.detailShadeReq = null
+    this.drapeUniforms.uDetailShadeOn.value = 0
+    this.drapeUniforms.uDetailShadeMap.value = null
+    this.detailShade?.texture.dispose()
+    this.detailShade = null
+  }
+
+  /**
+   * Higher-frequency hillshade for the live detail window, baked from a
+   * finer DEM over the exact bbox the color patch fetched so the two share
+   * one UV window texel-for-texel. Skipped without the bake worker: the
+   * synchronous fallback has no cast shadows, and a sharper Lambert-only
+   * patch inside a shadowed base would contradict it along the window edge.
+   * Safe to call speculatively - every gate and freshness check lives here.
+   */
+  private requestDetailShade(): void {
+    const hf = this.hfInternal
+    const bbox = this.detailBbox
+    if (!hf || !bbox || this.drapeKind === null || this.reliefStrength <= 0) return
+    // One bake in flight at a time, like the base hillshade - the reply
+    // handler re-fires when the sun has moved on
+    if (this.detailShadeReq) return
+    if (
+      this.detailShade &&
+      this.detailShade.az === this.sunAz &&
+      this.detailShade.alt === this.sunAlt
+    ) {
+      return
+    }
+    if (!this.lightingWorker()) return
+    if (this.detailDem) {
+      this.postDetailShade(hf, this.detailDem)
+    } else if (!this.detailDemAbort) {
+      // No await here and the controller is set synchronously inside, so a
+      // second call cannot start a duplicate fetch
+      void this.fetchDetailDem(hf, bbox)
+    }
+  }
+
+  /**
+   * Fetch and decode the patch DEM, cache it, and kick the bake. Failures
+   * are silent like the image patch - the base hillshade is always there.
+   */
+  private async fetchDetailDem(hf: Heightfield, bbox: Bbox): Promise<void> {
+    // Smallest power of two with at least 3x the base grid's samples across
+    // the window (see DETAIL_DEM_MIN/MAX for the bounds rationale)
+    const groundSide = (bbox[2] - bbox[0]) * hf.meta.cos_lat
+    const wanted = (3 * groundSide) / hf.meta.resolution_m
+    let size = DETAIL_DEM_MIN
+    while (size < wanted && size < DETAIL_DEM_MAX) size *= 2
+
+    const abort = new AbortController()
+    this.detailDemAbort = abort
+    let raster: DecodedRaster
+    try {
+      const res = await fetch(demUrl(bbox, size), { signal: abort.signal })
+      if (!res.ok) return
+      // ArcGIS reports errors as JSON with HTTP 200
+      if (!(res.headers.get('content-type') ?? '').includes('tiff')) return
+      raster = decodeFloat32Tiff(await res.arrayBuffer())
+    } catch {
+      // Abort, network and malformed-TIFF failures are equally silent
+      return
+    } finally {
+      if (this.detailDemAbort === abort) this.detailDemAbort = null
+    }
+    // The patch this DEM was fetched for must still be the live one - bbox
+    // identity, not value equality, because refreshDetail commits a fresh
+    // array per patch and clearDetail nulls it
+    if (this.detailBbox !== bbox || this.hfInternal !== hf) return
+    // The area's own decode cleaned nodata down to the grid minimum; a
+    // patch can still catch a void (waterbodies often are in 3DEP), and a
+    // single 3.4e38 sample would blow the bake's headroom cutoff wide open
+    const d = raster.data
+    for (let i = 0; i < d.length; i++) {
+      const v = d[i]
+      if (!(Number.isFinite(v) && v > -12000 && v < 12000)) d[i] = hf.meta.min_elev
+    }
+    const [axmin, , , aymax] = hf.meta.bbox3857
+    this.detailDem = {
+      data: d,
+      width: raster.width,
+      height: raster.height,
+      // Ground metres, the worker grids' unit: mercator lengths over-count
+      // ground by 1/cos(lat), the same correction the base metadata carries
+      groundSize: groundSide,
+      offE: (bbox[0] - axmin) * hf.meta.cos_lat,
+      offS: (aymax - bbox[3]) * hf.meta.cos_lat,
+    }
+    // Back through the gates rather than straight to the bake: relief may
+    // have turned off or the sun debounce may still be running
+    this.requestDetailShade()
+  }
+
+  private postDetailShade(hf: Heightfield, dem: DetailDem): void {
+    const id = ++this.lightingJob
+    this.detailShadeReq = { id, token: this.detailToken, az: this.sunAz, alt: this.sunAlt }
+    this.postLightingJob({
+      job: 'patchHillshade',
+      jobId: id,
+      // Sliced because the cache keeps the original for the next sun move
+      // while the post transfers this buffer away
+      heights: dem.data.slice(),
+      width: dem.width,
+      height: dem.height,
+      groundSize: dem.groundSize,
+      sunAz: this.sunAz,
+      sunAlt: this.sunAlt,
+      baseHeights: hf.data.slice(),
+      baseWidth: hf.meta.width,
+      baseHeight: hf.meta.height,
+      baseGroundSize: hf.meta.ground_size_m,
+      baseOffsetEast: dem.offE,
+      baseOffsetSouth: dem.offS,
+    })
   }
 
   /**
@@ -608,6 +1113,10 @@ export class Viewer {
       Math.abs((prev[0] + prev[2]) / 2 - (sxmin + side / 2)) < side * 0.15 &&
       Math.abs((prev[1] + prev[3]) / 2 - (symin + side / 2)) < side * 0.15
     ) {
+      // The patch stands, but its shade may not: a camera nudge mid-bake
+      // token-drops the reply, so every rest on the same patch is the
+      // retry. No-ops when a current shade or an in-flight bake exists.
+      this.requestDetailShade()
       return
     }
 
@@ -651,6 +1160,11 @@ export class Viewer {
       side / mercW,
       side / mercH,
     )
+    // uDetailWindow just moved, and the old shade was baked for where it
+    // used to be - drop it now rather than blend misplaced shadows, and let
+    // the base hillshade cover the window until the new bake lands
+    this.clearDetailShade()
+    this.requestDetailShade()
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
       this.drapeUniforms.uDetailFade.value = 1
       this.detailFade = null
@@ -1037,10 +1551,15 @@ export class Viewer {
     this.summitTexture?.dispose()
     this.terrain?.geometry.dispose()
     this.detailAbort?.abort()
+    this.detailDemAbort?.abort()
     if (this.hillshadeTimer !== null) clearTimeout(this.hillshadeTimer)
     if (this.sunTimer !== null) clearTimeout(this.sunTimer)
+    this.lighting?.terminate()
+    this.lighting = null
     this.detailTexture?.dispose()
+    this.detailShade?.texture.dispose()
     this.hillshadeTexture?.dispose()
+    this.aoTexture?.dispose()
     this.material.map?.dispose()
     this.material.dispose()
     this.controls.dispose()

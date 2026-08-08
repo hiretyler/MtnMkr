@@ -52,6 +52,30 @@ const SIZES = [
   { value: 2048, label: '2048 - maximum' },
 ]
 
+// Contour intervals on offer. The choice is stored in metres whichever unit
+// system is showing, so a units switch only re-labels it - snapped to the
+// nearest interval the new system offers, which keeps the select's label and
+// the lines on the mountain describing the same spacing.
+const M_PER_FT = 0.3048
+const CONTOUR_M = [10, 25, 50, 100]
+const CONTOUR_FT = [40, 80, 200, 500]
+const CONTOUR_METERS = [...CONTOUR_M, ...CONTOUR_FT.map((ft) => ft * M_PER_FT)]
+
+function contourChoices(units: Units): { meters: number; label: string }[] {
+  return units === 'metric'
+    ? CONTOUR_M.map((m) => ({ meters: m, label: `${m} m` }))
+    : CONTOUR_FT.map((ft) => ({ meters: ft * M_PER_FT, label: `${ft} ft` }))
+}
+
+function nearestContour(meters: number, units: Units): number {
+  const choices = contourChoices(units)
+  let best = choices[0].meters
+  for (const c of choices) {
+    if (Math.abs(c.meters - meters) < Math.abs(best - meters)) best = c.meters
+  }
+  return best
+}
+
 function uid(): string {
   return crypto.randomUUID().slice(0, 8)
 }
@@ -115,6 +139,24 @@ export default function App() {
     const v = parseInt(localStorage.getItem('mtnmkr-relief') ?? '', 10)
     return Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : 35
   })
+  // Sky-view ambient occlusion strength, also whole percent. Independent of
+  // the sun: it darkens what the terrain itself closes off from the sky.
+  const [ao, setAo] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem('mtnmkr-ao') ?? '', 10)
+    return Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : 40
+  })
+  // Slope-angle tint strength, whole percent. Off by default - it is a
+  // reading aid, not a look, and it hides the drape underneath it.
+  const [slope, setSlope] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem('mtnmkr-slope') ?? '', 10)
+    return Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : 0
+  })
+  // Contour interval in metres, 0 = off. Validated against the offered set
+  // rather than a range: anything else came from a hand-edited key.
+  const [contours, setContours] = useState<number>(() => {
+    const v = parseFloat(localStorage.getItem('mtnmkr-contours') ?? '')
+    return CONTOUR_METERS.find((m) => Math.abs(m - v) < 1e-6) ?? 0
+  })
   // Sun position for relief shading: compass azimuth constrained to the
   // real daily arc - east (90) through south to west (270) - and altitude
   // above the horizon, both degrees
@@ -173,39 +215,53 @@ export default function App() {
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
-    const viewer = new Viewer(canvas, {
-      onPickTerrain: (lon, lat) => {
-        const m = modeRef.current
-        if (m.type === 'place-note') {
-          const note: NoteOverlay = {
-            id: uid(),
-            kind: 'note',
-            name: 'Trip note',
-            visible: true,
-            lon,
-            lat,
-            body: '',
+    const viewer = new Viewer(
+      canvas,
+      {
+        onPickTerrain: (lon, lat) => {
+          const m = modeRef.current
+          if (m.type === 'place-note') {
+            const note: NoteOverlay = {
+              id: uid(),
+              kind: 'note',
+              name: 'Trip note',
+              visible: true,
+              lon,
+              lat,
+              body: '',
+            }
+            setOverlays((prev) => [...prev, note])
+            setSelectedId(note.id)
+            setMode({ type: 'idle' })
+          } else if (m.type === 'place-photo' || m.type === 'move') {
+            updateOverlay(m.id, { lon, lat })
+            setSelectedId(m.id)
+            setMode({ type: 'idle' })
+          } else {
+            setSelectedId(null)
           }
-          setOverlays((prev) => [...prev, note])
-          setSelectedId(note.id)
-          setMode({ type: 'idle' })
-        } else if (m.type === 'place-photo' || m.type === 'move') {
-          updateOverlay(m.id, { lon, lat })
-          setSelectedId(m.id)
-          setMode({ type: 'idle' })
-        } else {
-          setSelectedId(null)
-        }
+        },
+        onSelectOverlay: (id) => {
+          if (modeRef.current.type === 'idle') setSelectedId(id)
+        },
+        onHeadingChange: (roseDeg) => {
+          // Direct DOM write - this fires from the render loop
+          if (roseRef.current) roseRef.current.style.transform = `rotate(${roseDeg}deg)`
+        },
       },
-      onSelectOverlay: (id) => {
-        if (modeRef.current.type === 'idle') setSelectedId(id)
+      {
+        // Spawned from here, not from the viewer: see ViewerOptions
+        lightingWorker: () =>
+          new Worker(new URL('./lighting-worker.ts', import.meta.url), { type: 'module' }),
       },
-      onHeadingChange: (roseDeg) => {
-        // Direct DOM write - this fires from the render loop
-        if (roseRef.current) roseRef.current.style.transform = `rotate(${roseDeg}deg)`
-      },
-    })
+    )
     viewerRef.current = viewer
+    // Dev-only handle for browser-automation checks: the render loop parks
+    // when the tab is hidden, so tests drive the camera directly instead of
+    // through synthetic wheel events that MapControls may never see
+    if (import.meta.env.DEV) {
+      ;(window as unknown as { __viewer?: Viewer }).__viewer = viewer
+    }
     return () => {
       viewer.dispose()
       viewerRef.current = null
@@ -280,6 +336,30 @@ export default function App() {
     const t = setTimeout(() => localStorage.setItem('mtnmkr-relief', String(relief)), 200)
     return () => clearTimeout(t)
   }, [relief])
+
+  useEffect(() => {
+    viewerRef.current?.setAoStrength(ao / 100)
+    const t = setTimeout(() => localStorage.setItem('mtnmkr-ao', String(ao)), 200)
+    return () => clearTimeout(t)
+  }, [ao])
+
+  useEffect(() => {
+    viewerRef.current?.setSlopeShading(slope / 100)
+    const t = setTimeout(() => localStorage.setItem('mtnmkr-slope', String(slope)), 200)
+    return () => clearTimeout(t)
+  }, [slope])
+
+  useEffect(() => {
+    viewerRef.current?.setContourInterval(contours)
+    const t = setTimeout(() => localStorage.setItem('mtnmkr-contours', String(contours)), 200)
+    return () => clearTimeout(t)
+  }, [contours])
+
+  // A stored metric interval has no exact imperial twin, so switching units
+  // moves the choice to the nearest one the new list offers
+  useEffect(() => {
+    setContours((prev) => (prev > 0 ? nearestContour(prev, units) : prev))
+  }, [units])
 
   useEffect(() => {
     viewerRef.current?.setSunPosition(sunAz, sunAlt)
@@ -1139,6 +1219,53 @@ export default function App() {
               disabled={!meta || layer === 'shaded' || layer.startsWith('custom:')}
               onChange={(e) => setRelief(parseInt(e.target.value, 10))}
             />
+          </label>
+          <label className="field">
+            <span>
+              Ambient occlusion <em className="mono">{ao}%</em>
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={ao}
+              disabled={!meta || layer === 'shaded' || layer.startsWith('custom:')}
+              onChange={(e) => setAo(parseInt(e.target.value, 10))}
+            />
+          </label>
+          {/* Slope and contours are shader-computed from the mesh, not from a
+              bake keyed to the base drape, so unlike relief and AO they work
+              over a custom GeoTIFF layer too - only the untextured shaded
+              layer has nothing to draw them on. */}
+          <label className="field">
+            <span>
+              Slope shading <em className="mono">{slope}%</em>
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={slope}
+              disabled={!meta}
+              onChange={(e) => setSlope(parseInt(e.target.value, 10))}
+            />
+          </label>
+          <label className="field">
+            <span>Contours</span>
+            <select
+              value={contours}
+              disabled={!meta}
+              onChange={(e) => setContours(parseFloat(e.target.value))}
+            >
+              <option value={0}>Off</option>
+              {contourChoices(units).map((c) => (
+                <option key={c.label} value={c.meters}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
           </label>
           <label className="field">
             <span>

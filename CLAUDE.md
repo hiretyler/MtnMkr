@@ -53,6 +53,15 @@ directly (they send CORS on the image responses).
   need one human eyeball pass (verification window was backgrounded).
 - Photogrammetry/splats: analysis done, nothing built - see README
   "Photogrammetry and 3D scans" for the client-local plan and phases.
+- Relief suite (2026-08-08): sun-position sliders (E-S-W arc), worker-baked
+  cast shadows + sky-view AO, slope-angle tint, contour overlay, and
+  DEM-backed detail-patch shading all verified in-browser at the state and
+  network level; the close-zoom detail-shade pixels still want one human
+  eyeball pass. The standalone HTML/ePub export viewer has none of these
+  yet (fixed NW sun, no worker by design - see ViewerOptions.lightingWorker).
+- Browser-automation aid: in dev builds the live Viewer instance is exposed
+  as `window.__viewer` - drive the camera/private methods directly instead
+  of synthetic wheel events (the hidden-tab parking gotcha above).
 - 13ers deliberately not pre-baked (slow live path is intentional).
 - Runbook checks never done: offline reload, iPhone home-screen install.
 - r2.dev public URL is rate-limited (dev tier); upgrade path is a custom
