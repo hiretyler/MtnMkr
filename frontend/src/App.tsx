@@ -6,7 +6,7 @@ import {
   TEXTURE_EST_BYTES,
   VIEWER_BUNDLE_EST_BYTES,
 } from './export'
-import { formatDMS, trackLengthKm } from './geo'
+import { compassPoint, formatDMS, trackStats } from './geo'
 import { exportStandaloneEpub } from './epub'
 import { parseGpx, parseKml, parseKmz, photoFromFile } from './parsers'
 import { exportUsdz } from './usdz'
@@ -113,6 +113,19 @@ export default function App() {
     const v = parseInt(localStorage.getItem('mtnmkr-relief') ?? '', 10)
     return Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : 35
   })
+  // Sun position for relief shading: compass azimuth (0 = light from the
+  // north) and altitude above the horizon, both degrees
+  const [sunAz, setSunAz] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem('mtnmkr-sun-az') ?? '', 10)
+    return Number.isFinite(v) ? Math.min(359, Math.max(0, v)) : 315
+  })
+  const [sunAlt, setSunAlt] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem('mtnmkr-sun-alt') ?? '', 10)
+    return Number.isFinite(v) ? Math.min(85, Math.max(5, v)) : 45
+  })
+  const [panelOpen, setPanelOpen] = useState(
+    () => localStorage.getItem('mtnmkr-panel') !== 'closed',
+  )
   const [radiusKm, setRadiusKm] = useState(4)
   const [size, setSize] = useState(1024)
   const [center, setCenter] = useState<{ lat: number; lon: number; name: string | null } | null>(
@@ -268,6 +281,21 @@ export default function App() {
     const t = setTimeout(() => localStorage.setItem('mtnmkr-relief', String(relief)), 200)
     return () => clearTimeout(t)
   }, [relief])
+
+  useEffect(() => {
+    viewerRef.current?.setSunPosition(sunAz, sunAlt)
+    const t = setTimeout(() => {
+      localStorage.setItem('mtnmkr-sun-az', String(sunAz))
+      localStorage.setItem('mtnmkr-sun-alt', String(sunAlt))
+    }, 200)
+    return () => clearTimeout(t)
+  }, [sunAz, sunAlt])
+
+  // Placement clicks own the canvas - a route sweeps the whole terrain, and
+  // dropping a note onto the track must not select the track instead
+  useEffect(() => {
+    viewerRef.current?.setTrackPicking(mode.type === 'idle')
+  }, [mode])
 
   // Summit benchmark. For a named peak, hill-climb from its coordinates
   // to the local maximum - the peak the user asked for, never a taller
@@ -839,6 +867,20 @@ export default function App() {
     return sc ? hf.heightAt(sc[0], sc[1]) : null
   }
 
+  // Memoized: recomputing a long route's stats on every unrelated render
+  // (slider drags re-render the whole panel) would be wasted work
+  const selectedTrackStats = useMemo(
+    () =>
+      selected?.kind === 'track'
+        ? trackStats(selected.segments, (lon, lat) => {
+            if (!hf) return null
+            const sc = hf.sceneFromLonLat(lon, lat)
+            return sc ? hf.heightAt(sc[0], sc[1]) : null
+          })
+        : null,
+    [selected, hf],
+  )
+
   const hint =
     mode.type === 'place-note'
       ? 'Click the terrain to drop the note. Esc cancels.'
@@ -857,7 +899,7 @@ export default function App() {
 
   return (
     <div className="app" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
-      <aside className="panel">
+      <aside className={panelOpen ? 'panel' : 'panel closed'}>
         <header className="masthead">
           <h1>MtnMkr</h1>
         </header>
@@ -1005,6 +1047,24 @@ export default function App() {
               </ul>
             )}
           </div>
+        </section>
+
+        {meta && (
+          <section className="sheet">
+            <h2>Peak Data</h2>
+            <div className="sheet-name">{center?.name ?? 'Unnamed area'}</div>
+            <div className="mono sheet-line">{formatDMS(meta.lat, meta.lon)}</div>
+            <div className="mono sheet-line">
+              {meta.dem_source === 'usgs-3dep' ? 'USGS 3DEP lidar/DEM' : 'Terrarium 30 m (non-US)'}
+              {' · '}
+              {fmtRes(meta.resolution_m, units)}
+            </div>
+            <HypsoStrip min={meta.min_elev} max={meta.max_elev} units={units} />
+          </section>
+        )}
+
+        <section>
+          <h2>Terrain</h2>
           <label className="field">
             <span>
               Radius <em className="mono">{fmtDistKm(radiusKm, units)}</em>
@@ -1037,20 +1097,6 @@ export default function App() {
             </button>
           )}
         </section>
-
-        {meta && (
-          <section className="sheet">
-            <h2>Peak Data</h2>
-            <div className="sheet-name">{center?.name ?? 'Unnamed area'}</div>
-            <div className="mono sheet-line">{formatDMS(meta.lat, meta.lon)}</div>
-            <div className="mono sheet-line">
-              {meta.dem_source === 'usgs-3dep' ? 'USGS 3DEP lidar/DEM' : 'Terrarium 30 m (non-US)'}
-              {' · '}
-              {fmtRes(meta.resolution_m, units)}
-            </div>
-            <HypsoStrip min={meta.min_elev} max={meta.max_elev} units={units} />
-          </section>
-        )}
 
         <section>
           <h2>Layers</h2>
@@ -1095,6 +1141,37 @@ export default function App() {
               value={relief}
               disabled={!meta || layer === 'shaded' || layer.startsWith('custom:')}
               onChange={(e) => setRelief(parseInt(e.target.value, 10))}
+            />
+          </label>
+          <label className="field">
+            <span>
+              Sun direction{' '}
+              <em className="mono">
+                {compassPoint(sunAz)} · {sunAz}°
+              </em>
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={359}
+              step={1}
+              value={sunAz}
+              disabled={!meta}
+              onChange={(e) => setSunAz(parseInt(e.target.value, 10))}
+            />
+          </label>
+          <label className="field">
+            <span>
+              Sun height <em className="mono">{sunAlt}°</em>
+            </span>
+            <input
+              type="range"
+              min={5}
+              max={85}
+              step={1}
+              value={sunAlt}
+              disabled={!meta}
+              onChange={(e) => setSunAlt(parseInt(e.target.value, 10))}
             />
           </label>
           <label className="field">
@@ -1284,6 +1361,19 @@ export default function App() {
       <main className="stage">
         <canvas ref={canvasRef} />
         <button
+          className="panel-toggle"
+          title={panelOpen ? 'Hide panel' : 'Show panel'}
+          aria-label={panelOpen ? 'Hide the side panel' : 'Show the side panel'}
+          aria-expanded={panelOpen}
+          onClick={() => {
+            const next = !panelOpen
+            setPanelOpen(next)
+            localStorage.setItem('mtnmkr-panel', next ? 'open' : 'closed')
+          }}
+        >
+          {panelOpen ? '◂' : '▸'}
+        </button>
+        <button
           className="compass"
           title="Face north"
           aria-label="Face north"
@@ -1416,12 +1506,24 @@ export default function App() {
                 </div>
               </>
             )}
-            {selected.kind === 'track' && (
+            {selected.kind === 'track' && selectedTrackStats && (
               <>
                 <div className="ins-name">{selected.name}</div>
                 <div className="mono ins-line">
-                  {fmtDistKm(trackLengthKm(selected.segments), units)} ·{' '}
-                  {selected.segments.reduce((n, s) => n + s.length, 0)} points
+                  {fmtDistKm(selectedTrackStats.km, units)}
+                  {selectedTrackStats.gainM != null &&
+                    ` · ↑ ${fmtElev(selectedTrackStats.gainM, units)}`}
+                  {selectedTrackStats.lossM != null &&
+                    ` · ↓ ${fmtElev(selectedTrackStats.lossM, units)}`}
+                </div>
+                <div className="mono ins-line">
+                  {selectedTrackStats.minElev != null &&
+                    selectedTrackStats.maxElev != null &&
+                    `low ${fmtElev(selectedTrackStats.minElev, units)} · high ${fmtElev(
+                      selectedTrackStats.maxElev,
+                      units,
+                    )} · `}
+                  {selectedTrackStats.points} points
                 </div>
                 <label className="field">
                   <span>Color</span>

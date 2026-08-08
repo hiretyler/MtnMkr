@@ -145,6 +145,10 @@ export class Viewer {
   // layer's pixels over the old layer's texture
   private basePending = false
   private reliefStrength = 0
+  private sun: THREE.DirectionalLight
+  private sunAz = 315
+  private sunAlt = 45
+  private sunTimer: ReturnType<typeof setTimeout> | null = null
   private hillshadeTexture: THREE.DataTexture | null = null
   private hillshadeTimer: ReturnType<typeof setTimeout> | null = null
   private detailToken = 0
@@ -163,6 +167,12 @@ export class Viewer {
   private exag = 1
   private lastOverlays: Overlay[] = []
   private lastSelected: string | null = null
+  // Draped track polylines for screen-space picking (scene coordinates,
+  // the same subdivided runs the Line2 geometries were built from)
+  private trackRuns: { id: string; flat: number[] }[] = []
+  // Off while a placement mode owns clicks - a route sweeps the whole
+  // terrain, and dropping a note onto the track is a normal thing to do
+  private trackPicking = true
 
   private pointerDown: { x: number; y: number; button: number } | null = null
   private camAnim: {
@@ -194,10 +204,10 @@ export class Viewer {
 
     const hemi = new THREE.HemisphereLight(0xe8f0f7, 0x8a7f6a, 0.85)
     this.scene.add(hemi)
-    // Cartographic convention: relief lit from the northwest
-    const sun = new THREE.DirectionalLight(0xfff2de, 2.0)
-    sun.position.set(-0.55, 1.0, -0.65)
-    this.scene.add(sun)
+    this.sun = new THREE.DirectionalLight(0xfff2de, 2.0)
+    // Cartographic convention: lit from the northwest until told otherwise
+    this.placeSun()
+    this.scene.add(this.sun)
     this.scene.add(this.overlayGroup)
 
     this.material = new THREE.MeshStandardMaterial({
@@ -405,6 +415,43 @@ export class Viewer {
     this.applyRelief()
   }
 
+  /**
+   * Sun position: compass azimuth in degrees (0 = sun in the north) and
+   * altitude above the horizon. The scene light moves immediately - live
+   * feedback on every layer, including the untextured shaded one - while
+   * the per-texel hillshade rebake is debounced behind the slider drag,
+   * keeping the old bake on screen until the new one lands.
+   */
+  setSunPosition(azimuthDeg: number, altitudeDeg: number): void {
+    if (azimuthDeg === this.sunAz && altitudeDeg === this.sunAlt) return
+    this.sunAz = azimuthDeg
+    this.sunAlt = altitudeDeg
+    this.placeSun()
+    if (this.sunTimer !== null) clearTimeout(this.sunTimer)
+    this.sunTimer = setTimeout(() => {
+      this.sunTimer = null
+      // Only when a bake is already on screen; otherwise the lazy path in
+      // applyRelief builds with the current angles when first needed
+      if (this.hfInternal && this.hillshadeTexture) {
+        const tex = buildHillshadeTexture(this.hfInternal, this.sunAz, this.sunAlt)
+        this.hillshadeTexture.dispose()
+        this.hillshadeTexture = tex
+        this.drapeUniforms.uHillshadeMap.value = tex
+      }
+    }, 150)
+  }
+
+  /** Scene space is x = east, y = up, z = south. */
+  private placeSun(): void {
+    const az = THREE.MathUtils.degToRad(this.sunAz)
+    const alt = THREE.MathUtils.degToRad(this.sunAlt)
+    this.sun.position.set(
+      Math.sin(az) * Math.cos(alt),
+      Math.sin(alt),
+      -Math.cos(az) * Math.cos(alt),
+    )
+  }
+
   private applyRelief(): void {
     const hf = this.hfInternal
     const on = this.drapeKind !== null && this.reliefStrength > 0 && hf !== null
@@ -418,7 +465,7 @@ export class Viewer {
       this.hillshadeTimer = setTimeout(() => {
         this.hillshadeTimer = null
         if (this.hfInternal === hf && !this.hillshadeTexture) {
-          this.hillshadeTexture = buildHillshadeTexture(hf)
+          this.hillshadeTexture = buildHillshadeTexture(hf, this.sunAz, this.sunAlt)
           this.drapeUniforms.uHillshadeMap.value = this.hillshadeTexture
         }
         // Raises uRelief now the texture exists - or reschedules when the
@@ -660,6 +707,7 @@ export class Viewer {
     for (const m of this.lineMaterials) m.dispose()
     this.lineMaterials = []
     this.pinSprites = []
+    this.trackRuns = []
   }
 
   private renderOverlays(): void {
@@ -710,11 +758,12 @@ export class Viewer {
             for (const [x, z] of run) {
               flat.push(x, this.elevToY(hf.heightAt(x, z)) + lift, z)
             }
+            this.trackRuns.push({ id: ov.id, flat })
             const geom = new LineGeometry()
             geom.setPositions(flat)
             const mat = new LineMaterial({
               color: new THREE.Color(ov.color).getHex(),
-              linewidth: 3.5,
+              linewidth: ov.id === this.lastSelected ? 5.5 : 3.5,
               // Pull line fragments toward the camera in depth so the small
               // lift never z-fights the terrain
               polygonOffset: true,
@@ -770,6 +819,84 @@ export class Viewer {
 
   // ---- picking ----------------------------------------------------------
 
+  /** Gate for track picking; off while a placement mode owns clicks. */
+  setTrackPicking(enabled: boolean): void {
+    this.trackPicking = enabled
+  }
+
+  /**
+   * Screen-space pick against the draped track polylines: distance from the
+   * click to each projected segment, nearest within 12 px wins. Line2's own
+   * raycast needs world-unit thresholds that never feel right across zoom
+   * levels; pixels are what the finger aims by. The winner is then checked
+   * against the heightfield so a track behind a ridge is not clickable
+   * through the mountain.
+   */
+  private pickTrack(px: number, py: number, rect: DOMRect): string | null {
+    const hf = this.hfInternal
+    if (!hf || this.trackRuns.length === 0) return null
+    const THRESH = 12
+    const viewProj = new THREE.Matrix4().multiplyMatrices(
+      this.camera.projectionMatrix,
+      this.camera.matrixWorldInverse,
+    )
+    const b = new THREE.Vector4()
+    let bestD2 = THRESH * THRESH
+    let bestId: string | null = null
+    const bestPoint = new THREE.Vector3()
+    for (const run of this.trackRuns) {
+      const f = run.flat
+      let ax = 0
+      let ay = 0
+      let aOk = false
+      for (let i = 0; i + 2 < f.length; i += 3) {
+        b.set(f[i], f[i + 1], f[i + 2], 1).applyMatrix4(viewProj)
+        const bOk = b.w > 0
+        const bx = ((b.x / b.w) * 0.5 + 0.5) * rect.width
+        const by = ((-b.y / b.w) * 0.5 + 0.5) * rect.height
+        if (aOk && bOk && i > 0) {
+          const dx = bx - ax
+          const dy = by - ay
+          const len2 = dx * dx + dy * dy
+          const t =
+            len2 > 0
+              ? THREE.MathUtils.clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0, 1)
+              : 0
+          const ddx = px - (ax + dx * t)
+          const ddy = py - (ay + dy * t)
+          const d2 = ddx * ddx + ddy * ddy
+          if (d2 < bestD2) {
+            bestD2 = d2
+            bestId = run.id
+            bestPoint.set(
+              f[i - 3] + (f[i] - f[i - 3]) * t,
+              f[i - 2] + (f[i + 1] - f[i - 2]) * t,
+              f[i - 1] + (f[i + 2] - f[i - 1]) * t,
+            )
+          }
+        }
+        ax = bx
+        ay = by
+        aOk = bOk
+      }
+    }
+    if (!bestId) return null
+    // Occlusion: march the heightfield toward the picked point; a terrain
+    // hit clearly in front of it means a ridge is in the way. The margin
+    // absorbs the draping lift and the march's step size.
+    const dir = bestPoint.clone().sub(this.camera.position)
+    const dist = dir.length()
+    const hit = hf.raycast(
+      new THREE.Ray(this.camera.position, dir.normalize()),
+      this.exag,
+      hf.meta.min_elev,
+    )
+    if (hit && this.camera.position.distanceTo(hit) < dist - Math.max(15, dist * 0.015)) {
+      return null
+    }
+    return bestId
+  }
+
   // ---- compass ----------------------------------------------------------
 
   /**
@@ -824,6 +951,14 @@ export class Viewer {
     if (pinHits.length > 0) {
       this.events.onSelectOverlay(pinHits[0].object.userData.overlayId as string)
       return
+    }
+
+    if (this.trackPicking) {
+      const trackId = this.pickTrack(e.clientX - rect.left, e.clientY - rect.top, rect)
+      if (trackId) {
+        this.events.onSelectOverlay(trackId)
+        return
+      }
     }
 
     const hit = this.hfInternal.raycast(
@@ -903,6 +1038,7 @@ export class Viewer {
     this.terrain?.geometry.dispose()
     this.detailAbort?.abort()
     if (this.hillshadeTimer !== null) clearTimeout(this.hillshadeTimer)
+    if (this.sunTimer !== null) clearTimeout(this.sunTimer)
     this.detailTexture?.dispose()
     this.hillshadeTexture?.dispose()
     this.material.map?.dispose()

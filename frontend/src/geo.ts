@@ -258,23 +258,30 @@ export function buildTerrainGeometry(hf: Heightfield, exag: number): THREE.Buffe
 
 /**
  * Lambertian hillshade of the heightfield as a single-channel texture, lit
- * from azimuth 315 deg at 45 deg altitude - the same northwest-sun
- * convention as the scene lighting. Computed from true (unexaggerated)
+ * from the given sun position (compass azimuth in degrees, 0 = sun in the
+ * north; altitude in degrees above the horizon). Defaults to the
+ * cartographic northwest-sun convention. Computed from true (unexaggerated)
  * elevations: like the hillshade printed on a map it encodes the real
  * terrain, so it deliberately does not track the exaggeration slider - the
  * scene lighting already conveys exaggerated relief, and recomputing a
  * full-grid pass on every slider tick would buy nothing.
  * Rows are flipped so texture v matches the terrain UVs (v = 1 at north).
  */
-export function buildHillshadeTexture(hf: Heightfield): THREE.DataTexture {
+export function buildHillshadeTexture(
+  hf: Heightfield,
+  azimuthDeg = 315,
+  altitudeDeg = 45,
+): THREE.DataTexture {
   const { width: W, height: H } = hf.meta
   const d = hf.data
   const dx = hf.meta.ground_size_m / (W - 1)
   const dy = hf.meta.ground_size_m / (H - 1)
   // Sun direction in (east, north, up)
-  const lx = -0.5
-  const ly = 0.5
-  const lz = Math.SQRT1_2
+  const az = (azimuthDeg * Math.PI) / 180
+  const alt = (altitudeDeg * Math.PI) / 180
+  const lx = Math.sin(az) * Math.cos(alt)
+  const ly = Math.cos(az) * Math.cos(alt)
+  const lz = Math.sin(alt)
   const out = new Uint8Array(W * H)
   for (let r = 0; r < H; r++) {
     const rN = Math.max(r - 1, 0)
@@ -458,6 +465,65 @@ const COMPASS_POINTS = [
 /** Bearing as a 16-point compass label ("NNE"). */
 export function compassPoint(deg: number): string {
   return COMPASS_POINTS[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16]
+}
+
+export interface TrackStats {
+  km: number
+  points: number
+  gainM: number | null
+  lossM: number | null
+  minElev: number | null
+  maxElev: number | null
+}
+
+/**
+ * Route statistics for a track. Elevation per point prefers the recorded
+ * GPX/KML value and falls back to the sampler (DEM lookup); gain and loss
+ * accumulate through a 5 m hysteresis deadband so GPS elevation noise does
+ * not inflate the totals the way a raw sum of positive deltas would.
+ */
+export function trackStats(
+  segments: [number, number, number | null][][],
+  sample: (lon: number, lat: number) => number | null,
+): TrackStats {
+  const DEADBAND = 5
+  let points = 0
+  let gain = 0
+  let loss = 0
+  let minElev = Infinity
+  let maxElev = -Infinity
+  let sampled = false
+  for (const seg of segments) {
+    points += seg.length
+    let anchor: number | null = null
+    for (const [lon, lat, ele] of seg) {
+      const e = ele ?? sample(lon, lat)
+      if (e == null) continue
+      sampled = true
+      if (e < minElev) minElev = e
+      if (e > maxElev) maxElev = e
+      if (anchor === null) {
+        anchor = e
+        continue
+      }
+      const d = e - anchor
+      if (d >= DEADBAND) {
+        gain += d
+        anchor = e
+      } else if (d <= -DEADBAND) {
+        loss -= d
+        anchor = e
+      }
+    }
+  }
+  return {
+    km: trackLengthKm(segments),
+    points,
+    gainM: sampled ? gain : null,
+    lossM: sampled ? loss : null,
+    minElev: sampled ? minElev : null,
+    maxElev: sampled ? maxElev : null,
+  }
 }
 
 export function trackLengthKm(segments: [number, number, number | null][][]): number {
